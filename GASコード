@@ -1,0 +1,511 @@
+/**
+ * 供給メールレーダー v0.4（管理画面メニュー追加）
+ * ※ 管理画面.gs と admin.html を同じプロジェクトに追加して使う
+ * DSJP（DrugShortage.jp）医薬品供給情報メール → 採用薬マーク付き加工メールを送信
+ *
+ * 必要シート（このスクリプトをバインドするスプレッドシート内）
+ *   医薬品一覧 : 厚労省 薬価基準収載品目リスト（1行目ヘッダー。「薬価基準収載医薬品コード」「品名」「メーカー名」「規格」列を使用）
+ *   採用薬     : YJコード / 薬品名 / 規格 / メモ（1行目ヘッダー）
+ *   ログ       : 自動作成
+ *
+ * Gmailフィルタ（手動で設定）
+ *   From: noreply@drugshortage.jp → ラベル「DSJP/未処理」を付ける ＋ 受信トレイをスキップ
+ */
+
+// ===== 定数 =====
+const SHEET_MASTER = '医薬品一覧';
+const SHEET_ADOPTED = '採用薬';
+const SHEET_LOG = 'ログ';
+const YJ_RE = /^[0-9]{7}[A-Z][0-9A-Z]{4}$/;
+const STATUS_RE = /(通常出荷|限定出荷|供給停止|販売中止|販売移管)/;
+const STATUS_ORDER = ['供給停止', '販売中止', '限定出荷', '販売移管', '通常出荷', 'その他'];
+const STATUS_COLOR = {
+  '通常出荷': '#6dbb6d', '限定出荷': '#f0b24f', '供給停止': '#e06060',
+  '販売中止': '#333333', '販売移管': '#6f94c9', 'その他': '#999999'
+};
+const LEVEL_INFO = {
+  3: { mark: '★採用', color: '#c62828', title: '★ 採用薬' },
+  2: { mark: '◎同規格採用', color: '#e65100', title: '◎ 同規格・他銘柄を採用中' },
+  1: { mark: '○同成分採用', color: '#1565c0', title: '○ 同成分・同剤形（規格違い）を採用中' },
+  0: { mark: '', color: '#666666', title: 'その他（非採用）' }
+};
+
+// ===== 設定（スクリプトプロパティ） =====
+function cfg_() {
+  const p = PropertiesService.getScriptProperties().getProperties();
+  const bool = (v, d) => (v == null || v === '') ? d : /^(true|1|yes)$/i.test(String(v).trim());
+  return {
+    sendTo: p.SEND_TO || Session.getEffectiveUser().getEmail(),
+    labelTodo: p.LABEL_TODO || 'DSJP/未処理',
+    labelDone: p.LABEL_DONE || 'DSJP/処理済',
+    labelError: p.LABEL_ERROR || 'DSJP/エラー',
+    testQuery: p.TEST_QUERY || 'from:noreply@drugshortage.jp',
+    matchDepth: Math.min(3, Math.max(1, Number(p.MATCH_DEPTH || 3))), // 1:12桁のみ 2:上9桁まで 3:上8桁まで
+    hideTransfer: bool(p.HIDE_UNADOPTED_TRANSFER, true),
+    showMemo: bool(p.SHOW_MEMO, true),
+    senderName: p.SENDER_NAME || '供給メールレーダー',
+    sheetId: p.SHEET_ID || ''
+  };
+}
+
+// ===== メニュー =====
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('供給メールレーダー')
+    .addItem('未処理メールを今すぐ処理', 'processDsjp')
+    .addItem('最新のDSJPメールでテスト送信', 'testLatest')
+    .addSeparator()
+    .addItem('採用薬の管理画面を開く', 'openAdmin')
+    .addItem('採用薬シートをチェック', 'checkAdopted')
+    .addItem('初期設定（ラベル作成＋1時間トリガー）', 'setup')
+    .addToUi();
+}
+
+function setup() {
+  const c = cfg_();
+  [c.labelTodo, c.labelDone, c.labelError].forEach(getOrCreateLabel_);
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'processDsjp')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('processDsjp').timeBased().everyHours(1).create();
+  toast_('ラベル作成＆1時間トリガー設定 完了');
+}
+
+// ===== メイン処理（トリガーから呼ばれる） =====
+function processDsjp() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return;
+  try {
+    const c = cfg_();
+    const todo = GmailApp.getUserLabelByName(c.labelTodo);
+    if (!todo) { Logger.log('ラベルがありません: ' + c.labelTodo); return; }
+    const threads = todo.getThreads(0, 10);
+    if (!threads.length) return;
+
+    const ctx = loadContext_(c);
+    const done = getOrCreateLabel_(c.labelDone);
+    const err = getOrCreateLabel_(c.labelError);
+    const doneIds = loadDoneIds_();
+
+    threads.forEach(th => {
+      let ok = true;
+      th.getMessages().forEach(msg => {
+        if (doneIds.has(msg.getId())) return;
+        try {
+          const r = handleMessage_(msg, ctx, c, false);
+          if (r.mismatch) ok = false;
+        } catch (e) {
+          ok = false;
+          writeLog_(ctx.ss, [msg.getSubject(), '', '', '', '', '', '', 'エラー: ' + e.message]);
+        }
+        doneIds.add(msg.getId());
+      });
+      th.removeLabel(todo);
+      th.addLabel(ok ? done : err);
+      if (!ok) th.moveToInbox(); // 要確認時は元メールを受信トレイに戻す
+    });
+    saveDoneIds_(doneIds);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ===== テスト：最新のDSJPメールを加工して送信（ラベルは触らない） =====
+function testLatest() {
+  const c = cfg_();
+  const th = GmailApp.search(c.testQuery, 0, 1);
+  if (!th.length) throw new Error('メールが見つかりません（TEST_QUERY: ' + c.testQuery + '）');
+  const msgs = th[0].getMessages();
+  const r = handleMessage_(msgs[msgs.length - 1], loadContext_(c), c, true);
+  toast_('テスト送信しました（解析 ' + r.parsed + '件 / 通知 ' + r.expected + '件）');
+}
+
+// ===== 1通の処理 =====
+function handleMessage_(msg, ctx, c, isTest) {
+  let p = parseDsjp_(htmlToLines_(msg.getBody()));
+  if (!p.items.length) p = parseDsjp_(plainToLines_(msg.getPlainBody()));
+  p.items.forEach(it => matchItem_(it, ctx, c));
+  p.items.sort((a, b) =>
+    (b.level - a.level) ||
+    (STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status)) ||
+    a.name.localeCompare(b.name, 'ja'));
+
+  const n = lv => p.items.filter(it => it.level === lv).length;
+  const st = { l3: n(3), l2: n(2), l1: n(1), notFound: p.items.filter(it => !it.found).length };
+  const mismatch = !p.items.length || p.expected == null || p.expected !== p.items.length;
+
+  const orig = msg.getSubject();
+  const rel = st.l2 + st.l1;
+  const subject = (isTest ? '[TEST]' : '') + (mismatch ? '【要確認:件数不一致】' : '') +
+    '【採用' + st.l3 + '件' + (rel ? '・関連' + rel + '件' : '') + '】' + orig;
+
+  const MAX_BYTES = 150 * 1024;
+  const size = s => Utilities.newBlob(s).getBytes().length;
+  let html = renderHtml_(msg, p, st, c, mismatch, 'full');
+  if (size(html) > MAX_BYTES) html = renderHtml_(msg, p, st, c, mismatch, 'compact');
+  if (size(html) > MAX_BYTES) html = renderHtml_(msg, p, st, c, mismatch, 'minimal');
+  Logger.log('HTMLサイズ: ' + size(html) + ' bytes / 解析 ' + p.items.length + '件');
+  const plain = renderPlain_(p, st, mismatch);
+  GmailApp.sendEmail(c.sendTo, subject, plain, { htmlBody: html, name: c.senderName });
+
+  writeLog_(ctx.ss, [orig, p.expected == null ? '不明' : p.expected, p.items.length,
+    st.l3, st.l2, st.l1, st.notFound, (isTest ? 'TEST ' : '') + (mismatch ? '要確認' : 'OK')]);
+  return { mismatch, parsed: p.items.length, expected: p.expected };
+}
+
+// ===== マスタ読み込み =====
+function loadContext_(c) {
+  const ss = c.sheetId ? SpreadsheetApp.openById(c.sheetId) : SpreadsheetApp.getActiveSpreadsheet();
+
+  // 医薬品一覧
+  const ms = ss.getSheetByName(SHEET_MASTER);
+  if (!ms) throw new Error('シートがありません: ' + SHEET_MASTER);
+  const mv = ms.getDataRange().getValues();
+  const mh = mv[0].map(h => String(h).trim());
+  const col = name => {
+    const i = mh.indexOf(name);
+    if (i < 0) throw new Error(SHEET_MASTER + ' に列がありません: ' + name);
+    return i;
+  };
+  const cCode = col('薬価基準収載医薬品コード'), cName = col('品名'), cMaker = col('メーカー名'), cSpec = col('規格');
+  const byName = new Map();
+  const masterCodes = new Set();
+  for (let i = 1; i < mv.length; i++) {
+    const r = mv[i];
+    const code = normCode_(r[cCode]);
+    if (!YJ_RE.test(code)) continue;
+    masterCodes.add(code);
+    const key = norm_(r[cName]);
+    if (!key) continue;
+    if (!byName.has(key)) byName.set(key, []);
+    byName.get(key).push({ code, name: String(r[cName]), makerN: normMaker_(r[cMaker]), spec: String(r[cSpec]) });
+  }
+
+  // 採用薬
+  const as = ss.getSheetByName(SHEET_ADOPTED);
+  if (!as) throw new Error('シートがありません: ' + SHEET_ADOPTED);
+  const av = as.getDataRange().getValues();
+  const ah = av[0].map(h => String(h).trim());
+  const aCode = Math.max(0, ah.indexOf('YJコード'));
+  const aName = ah.indexOf('薬品名') >= 0 ? ah.indexOf('薬品名') : 1;
+  const aMemo = ah.indexOf('メモ') >= 0 ? ah.indexOf('メモ') : 3;
+  const a12 = new Map(), a9 = new Map(), a8 = new Map();
+  const push = (m, k, v) => { if (!m.has(k)) m.set(k, []); m.get(k).push(v); };
+  for (let i = 1; i < av.length; i++) {
+    const code = normCode_(av[i][aCode]);
+    if (!YJ_RE.test(code) || a12.has(code)) continue;
+    const rec = { code, name: String(av[i][aName] || ''), memo: String(av[i][aMemo] || '') };
+    a12.set(code, rec);
+    push(a9, code.slice(0, 9), rec);
+    push(a8, code.slice(0, 8), rec);
+  }
+  return { ss, byName, masterCodes, a12, a9, a8, adoptedRows: av, aCode };
+}
+
+// ===== 照合 =====
+function matchItem_(it, ctx, c) {
+  const all = ctx.byName.get(norm_(it.name)) || [];
+  let cands = all;
+  if (all.length > 1) { // 同名が複数 → 販売/製造メーカーで絞る
+    const mk = [normMaker_(it.seller), normMaker_(it.maker)].filter(Boolean);
+    const f = all.filter(x => x.makerN && mk.some(m => m === x.makerN || m.includes(x.makerN) || x.makerN.includes(m)));
+    if (f.length) cands = f;
+  }
+  it.found = cands.length > 0;
+  it.candCount = cands.length;
+
+  let level = 0, hits = [];
+  const tryLevel = (lv, fn) => {
+    if (level) return;
+    cands.forEach(x => { const h = fn(x); if (h) hits = hits.concat(h); });
+    if (hits.length) level = lv;
+  };
+  tryLevel(3, x => ctx.a12.has(x.code) ? [ctx.a12.get(x.code)] : null);
+  tryLevel(2, x => ctx.a9.get(x.code.slice(0, 9)) || null);
+  tryLevel(1, x => ctx.a8.get(x.code.slice(0, 8)) || null);
+  if (level && level < 4 - c.matchDepth) { level = 0; hits = []; }
+
+  const seen = new Set();
+  it.hits = hits.filter(h => !seen.has(h.code) && seen.add(h.code));
+  it.level = level;
+  it.partial = level === 3 && cands.length > 1 && !cands.every(x => ctx.a12.has(x.code));
+}
+
+// ===== パース =====
+function parseDsjp_(lines) {
+  const isHead = l => /^[|｜\s]*告知日/.test(l);
+  const first = lines.findIndex(isHead);
+  const pre = (first < 0 ? lines : lines.slice(0, first)).join(' ');
+  const mTotal = pre.match(/登録情報\s*([0-9,]+)\s*件/);
+  const expected = mTotal ? Number(mTotal[1].replace(/,/g, '')) : null;
+  const statusCounts = {};
+  const re = /(通常出荷|限定出荷|供給停止|販売中止|販売移管)\s*[:：]?\s*([0-9,]+)\s*件/g;
+  let m;
+  while ((m = re.exec(pre))) statusCounts[m[1]] = Number(m[2].replace(/,/g, ''));
+
+  const items = [];
+  if (first >= 0) {
+    let block = [];
+    for (let i = first; i < lines.length; i++) {
+      if (isHead(lines[i]) && block.length) { const it = parseBlock_(block); if (it) items.push(it); block = []; }
+      block.push(lines[i]);
+    }
+    if (block.length) { const it = parseBlock_(block); if (it) items.push(it); }
+  }
+  return { items, expected, statusCounts };
+}
+
+function parseBlock_(b) {
+  const head = b.slice(0, 4).join(' ');
+  const notice = (head.match(/告知日\s*[:：]\s*(\S+?日)/) || [])[1] || '';
+  const effective = (head.match(/実施日\s*[:：]\s*(\S+?日)/) || [])[1] || '';
+
+  const si = b.findIndex((l, i) => i > 0 && STATUS_RE.test(l) && !/[:：]/.test(l.replace(/⟦.*?⟧/g, '')));
+  if (si < 0) return null;
+  const status = b[si].match(STATUS_RE)[1];
+  const isCodeLike = l => l.length <= 5 && !l.includes('⟦');
+  const isMakerLine = l => /^(販売|製造)\s*[:：]/.test(l);
+
+  let ni = b.findIndex((l, i) => i > si && l.includes('⟦'));
+  if (ni < 0) ni = b.findIndex((l, i) => i > si && !isCodeLike(l) && !isMakerLine(l));
+  if (ni < 0) return null;
+
+  const extra = [b[si].replace(STATUS_RE, '').trim()].concat(b.slice(si + 1, ni)).filter(Boolean).join(' ');
+  const nm = b[ni].match(/^(.*?)⟦(.*?)⟧/);
+  const name = (nm ? nm[1] : b[ni]).trim();
+  const url = nm ? nm[2] : '';
+  const next = b[ni + 1] || '';
+  const pkg = (next && !isMakerLine(next) && !/告知日/.test(next)) ? next.replace(/⟦.*?⟧/g, '') : '';
+
+  const sLine = b.find(l => /販売\s*[:：]/.test(l)) || '';
+  const mLine = b.find(l => /製造\s*[:：]/.test(l)) || '';
+  const seller = ((sLine.match(/販売\s*[:：]\s*([^/／|｜]*)/) || [])[1] || '').trim();
+  const maker = ((mLine.match(/製造\s*[:：]\s*([^/／|｜]*)/) || [])[1] || '').trim();
+
+  const cut = (s, n) => s.length > n ? s.slice(0, n) + '…' : s;
+  return {
+    notice, effective, status, url,
+    extra: cut(extra, 60), name: cut(name, 120), pkg: cut(pkg, 120),
+    seller: cut(seller, 60), maker: cut(maker, 60)
+  };
+}
+
+function htmlToLines_(html) {
+  let h = String(html || '');
+  h = h.replace(/<(script|style|head)\b[\s\S]*?<\/\1>/gi, '');
+  h = h.replace(/<a\b[^>]*?href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (m, u, t) => {
+    const txt = decode_(t.replace(/<[^>]+>/g, '')).trim();
+    return txt ? txt + '⟦' + u + '⟧' : '';
+  });
+  h = h.replace(/<br\s*\/?>/gi, '\n')
+       .replace(/<hr\b[^>]*>/gi, '\n')
+       .replace(/<\/(p|div|tr|td|th|li|h[1-6]|table|dt|dd)>/gi, '\n');
+  h = decode_(h.replace(/<[^>]+>/g, ''));
+  return h.split(/\r?\n/).map(s => s.replace(/[\s\u00a0]+/g, ' ').trim()).filter(Boolean);
+}
+
+function plainToLines_(text) {
+  const out = [];
+  String(text || '').split(/\r?\n/).forEach(raw => {
+    const l = raw.replace(/[\s\u00a0]+/g, ' ').trim();
+    if (!l) return;
+    const onlyUrl = l.match(/^[<(（]?(https?:\/\/[^\s>)）]+)[>)）]?$/);
+    if (onlyUrl && out.length && !out[out.length - 1].includes('⟦')) {
+      out[out.length - 1] += '⟦' + onlyUrl[1] + '⟧';
+      return;
+    }
+    const m = l.match(/^(.+?)\s*[<(（]?(https?:\/\/[^\s>)）]+)[>)）]?$/);
+    out.push(m ? m[1].trim() + '⟦' + m[2] + '⟧' : l);
+  });
+  return out;
+}
+
+// ===== HTML生成 =====
+function renderHtml_(msg, p, st, c, mismatch, mode) {
+  mode = mode || 'full';
+  const now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm');
+  let h = '<div style="font-family:\'Hiragino Sans\',Meiryo,sans-serif;max-width:760px;color:#222;">';
+  h += '<div style="font-size:18px;font-weight:bold;margin-bottom:6px;">' + esc_(msg.getSubject()) + '</div>';
+
+  if (mismatch) {
+    h += '<div style="background:#fff3cd;border:1px solid #e0b000;padding:8px;margin:6px 0;font-size:13px;">' +
+      '⚠ 解析件数（' + p.items.length + '件）と通知件数（' + (p.expected == null ? '不明' : p.expected + '件') +
+      '）が一致しません。元メールを受信トレイに戻しています。</div>';
+  }
+
+  h += '<div style="background:#f6f8fa;border:1px solid #ddd;border-radius:6px;padding:8px 12px;font-size:13px;">' +
+    '<span style="color:#c62828;font-weight:bold;font-size:15px;">★採用 ' + st.l3 + '件</span>　' +
+    '<span style="color:#e65100;">◎同規格 ' + st.l2 + '件</span>　' +
+    '<span style="color:#1565c0;">○同成分 ' + st.l1 + '件</span><br>' +
+    '<span style="color:#666;">通知 ' + (p.expected == null ? '不明' : p.expected) + '件 / 解析 ' + p.items.length + '件' +
+    (st.notFound ? ' / 一覧で照合できず ' + st.notFound + '件' : '') + '</span><br>' +
+    STATUS_ORDER.filter(s => p.statusCounts[s] != null)
+      .map(s => badge_(s) + ' ' + p.statusCounts[s] + '件').join('　') +
+    '</div>';
+
+  [3, 2, 1].forEach(lv => {
+    const list = p.items.filter(it => it.level === lv);
+    if (!list.length && lv !== 3) return;
+    h += sectionTitle_(LEVEL_INFO[lv].title + '（' + list.length + '件）', LEVEL_INFO[lv].color);
+    h += list.length ? list.map(it =>
+        (mode === 'minimal' && lv < 3) ? compactItemHtml_(it) : itemHtml_(it, c)).join('') :
+      '<div style="font-size:13px;color:#666;padding:6px 4px;">該当なし</div>';
+  });
+
+  const others = p.items.filter(it => it.level === 0);
+  const folded = c.hideTransfer ? others.filter(it => it.status === '販売移管') : [];
+  const shown = others.filter(it => folded.indexOf(it) < 0);
+  if (others.length) {
+    h += sectionTitle_(LEVEL_INFO[0].title + '（' + others.length + '件）', '#666666');
+    if (mode === 'full') h += shown.map(it => itemHtml_(it, c)).join('');
+    else if (mode === 'compact') h += shown.map(it => compactItemHtml_(it)).join('');
+    else h += '<div style="font-size:12px;color:#888;padding:6px 4px;">非採用 ' + shown.length + '件は省略（元メール参照）</div>';
+    if (folded.length) {
+      h += '<div style="font-size:11px;color:#888;border-top:1px solid #ddd;padding:6px 4px;">' +
+        badge_('販売移管') + ' 非採用 ' + folded.length + '件（省略）' +
+        (mode === 'minimal' ? '' : '：' + folded.map(it => esc_(it.name)).join('、')) + '</div>';
+    }
+  }
+
+  h += '<div style="font-size:11px;color:#999;margin-top:16px;border-top:1px solid #eee;padding-top:6px;">' +
+    '出典：<a href="https://www.drugshortage.jp/" style="color:#999;">DSJP（DrugShortage.jp）</a>' +
+    '　／　照合：厚生労働省「薬価基準収載品目リスト」を加工して使用<br>' +
+    '<a href="https://mail.google.com/mail/u/0/#all/' + msg.getId() + '">元メールを開く</a>　' +
+    '生成：' + now + '（供給メールレーダー）</div></div>';
+  return h;
+}
+
+function itemHtml_(it, c) {
+  const lv = LEVEL_INFO[it.level];
+  let h = '<div style="border-top:1px solid #ddd;padding:8px 4px;' + (it.level === 3 ? 'background:#fff6f6;' : '') + '">';
+  h += '<div style="font-size:11px;color:#777;">告知日：' + esc_(it.notice) + '　実施日：' + esc_(it.effective) + '</div>';
+  h += '<div style="margin:3px 0;">' + badge_(it.status);
+  if (it.extra) h += ' <span style="font-size:11px;color:#555;">' + esc_(it.extra) + '</span>';
+  if (lv.mark) {
+    h += ' <span style="font-size:11px;font-weight:bold;color:' + lv.color + ';border:1px solid ' + lv.color +
+      ';border-radius:3px;padding:0 4px;">' + lv.mark + '</span>';
+  }
+  h += '</div>';
+  const nameHtml = it.url ? '<a href="' + esc_(it.url) + '" style="color:#1a4fb5;">' + esc_(it.name) + '</a>' : esc_(it.name);
+  h += '<div style="font-size:' + (it.level === 3 ? 16 : 14) + 'px;' + (it.level ? 'font-weight:bold;' : '') + '">' + nameHtml + '</div>';
+  if (it.pkg) h += '<div style="font-size:11px;color:#666;">' + esc_(it.pkg) + '</div>';
+  if (it.seller || it.maker) {
+    h += '<div style="font-size:12px;color:#444;">販売：' + esc_(it.seller) + ' / 製造：' + esc_(it.maker) + '</div>';
+  }
+  if (it.hits.length) {
+    h += '<div style="font-size:12px;color:' + lv.color + ';margin-top:2px;">採用中：' +
+      it.hits.map(x => esc_(x.name) +
+        (c.showMemo && x.memo ? '<span style="color:#777;font-weight:normal;">（' + esc_(x.memo) + '）</span>' : '')
+      ).join(' / ') + '</div>';
+  }
+  if (it.partial) h += '<div style="font-size:11px;color:#b36b00;">※同名で規格違いあり（採用規格か要確認）</div>';
+  if (!it.found) h += '<div style="font-size:11px;color:#999;">※医薬品一覧で品名が見つからず照合不可</div>';
+  return h + '</div>';
+}
+
+function compactItemHtml_(it) {
+  const link = it.url ? '<a href="' + esc_(it.url) + '" style="color:#1a4fb5;">' + esc_(it.name) + '</a>' : esc_(it.name);
+  return '<div style="font-size:12px;border-top:1px solid #eee;padding:3px 4px;">' +
+    badge_(it.status) + ' ' + (it.level ? '<b>' + link + '</b>' : link) +
+    '<span style="color:#888;">（' + esc_(it.seller) + '）</span></div>';
+}
+
+function renderPlain_(p, st, mismatch) {
+  const lines = [];
+  if (mismatch) lines.push('⚠ 件数不一致：通知 ' + p.expected + '件 / 解析 ' + p.items.length + '件');
+  lines.push('★採用 ' + st.l3 + '件 / ◎同規格 ' + st.l2 + '件 / ○同成分 ' + st.l1 + '件', '');
+  p.items.filter(it => it.level > 0).forEach(it => {
+    lines.push(LEVEL_INFO[it.level].mark + ' [' + it.status + '] ' + it.name + '（' + it.seller + '）');
+  });
+  lines.push('', '出典：DSJP（DrugShortage.jp） https://www.drugshortage.jp/',
+    '照合：厚生労働省「薬価基準収載品目リスト」を加工して使用');
+  return lines.join('\n');
+}
+
+function badge_(s) {
+  return '<span style="display:inline-block;background:' + (STATUS_COLOR[s] || '#999') +
+    ';color:#fff;border-radius:10px;padding:1px 10px;font-size:12px;">' + esc_(s) + '</span>';
+}
+
+function sectionTitle_(t, color) {
+  return '<div style="margin-top:14px;padding:4px 8px;border-left:5px solid ' + color +
+    ';font-weight:bold;font-size:15px;color:' + color + ';">' + esc_(t) + '</div>';
+}
+
+// ===== 採用薬チェック =====
+function checkAdopted() {
+  const ctx = loadContext_(cfg_());
+  const rows = ctx.adoptedRows;
+  const bad = [], dup = [], seen = new Set();
+  let ok = 0, only9 = 0, none = 0;
+  for (let i = 1; i < rows.length; i++) {
+    const code = normCode_(rows[i][ctx.aCode]);
+    if (!YJ_RE.test(code)) { bad.push(i + 1); continue; }
+    if (seen.has(code)) { dup.push(i + 1); continue; }
+    seen.add(code);
+    if (ctx.masterCodes.has(code)) ok++;
+    else if ([...ctx.masterCodes].some(m => m.slice(0, 9) === code.slice(0, 9))) only9++;
+    else none++;
+  }
+  const msg = [
+    '有効コード：' + seen.size + '件',
+    '　12桁一致：' + ok + '件',
+    '　上9桁のみ一致（銘柄違い・旧コード）：' + only9 + '件',
+    '　一覧に該当なし：' + none + '件',
+    'コード形式エラー行：' + (bad.length ? bad.slice(0, 20).join(', ') + (bad.length > 20 ? ' ほか' : '') : 'なし'),
+    '重複行：' + (dup.length ? dup.join(', ') : 'なし')
+  ].join('\n');
+  SpreadsheetApp.getUi().alert('採用薬チェック', msg, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+// ===== ユーティリティ =====
+function norm_(s) {
+  return String(s == null ? '' : s).normalize('NFKC').replace(/[\s\u3000]/g, '').toUpperCase();
+}
+function normMaker_(s) {
+  return norm_(s).replace(/株式会社|有限会社|\(株\)|\(有\)/g, '');
+}
+function normCode_(s) {
+  return String(s == null ? '' : s).normalize('NFKC').trim().toUpperCase();
+}
+function esc_(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function decode_(s) {
+  return String(s)
+    .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'")
+    .replace(/&#(\d+);/g, (m, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (m, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&amp;/g, '&');
+}
+function getOrCreateLabel_(name) {
+  let label = GmailApp.getUserLabelByName(name);
+  if (label) return label;
+  const parts = name.split('/');
+  for (let i = 1; i <= parts.length; i++) {
+    const n = parts.slice(0, i).join('/');
+    label = GmailApp.getUserLabelByName(n) || GmailApp.createLabel(n);
+  }
+  return label;
+}
+function loadDoneIds_() {
+  const v = PropertiesService.getScriptProperties().getProperty('DONE_IDS');
+  return new Set(v ? JSON.parse(v) : []);
+}
+function saveDoneIds_(set) {
+  const arr = [...set].slice(-300);
+  PropertiesService.getScriptProperties().setProperty('DONE_IDS', JSON.stringify(arr));
+}
+function writeLog_(ss, row) {
+  let sh = ss.getSheetByName(SHEET_LOG);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_LOG);
+    sh.appendRow(['日時', '元件名', '通知件数', '解析件数', '★採用', '◎同規格', '○同成分', '照合不可', '結果']);
+    sh.setFrozenRows(1);
+  }
+  sh.appendRow([Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm')].concat(row));
+}
+function toast_(m) {
+  try { SpreadsheetApp.getActiveSpreadsheet().toast(m, '供給メールレーダー', 5); } catch (e) { Logger.log(m); }
+}

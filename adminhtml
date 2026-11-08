@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  :root{
+    --teal:#12a39a; --teal-d:#0d7d76; --teal-l:#e6f6f4;
+    --coral:#f26b5b; --coral-l:#ffecE9; --sun:#ffb830; --sun-l:#fff6d6;
+    --ink:#1f2d3d; --sub:#5d6b78; --line:#e3e8ea; --bg:#f4f8f8; --white:#fff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:"Hiragino Sans","Meiryo UI",Meiryo,sans-serif;font-size:14px}
+  header{background:var(--teal);color:#fff;padding:14px 20px;display:flex;align-items:center;gap:12px}
+  header h1{margin:0;font-size:19px}
+  header .sheet{font-size:12px;opacity:.85}
+  main{padding:16px 20px 40px;max-width:1080px;margin:0 auto}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:14px}
+  .stat{background:var(--white);border:1px solid var(--line);border-radius:12px;padding:12px 16px}
+  .stat .k{font-size:12px;color:var(--sub)}
+  .stat .v{font-size:28px;font-weight:700;color:var(--teal-d);line-height:1.3}
+  .stat .v small{font-size:14px}
+  .stat .s{font-size:12px;color:var(--sub)}
+  details.card{background:var(--white);border:1px solid var(--line);border-radius:12px;margin-bottom:12px;overflow:hidden}
+  details.card>summary{list-style:none;cursor:pointer;padding:12px 16px;font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px}
+  details.card>summary::-webkit-details-marker{display:none}
+  details.card>summary::after{content:"▸";margin-left:auto;color:var(--sub);transition:transform .15s}
+  details.card[open]>summary::after{transform:rotate(90deg)}
+  details.card[open]>summary{border-bottom:1px solid var(--line)}
+  .body{padding:14px 16px}
+  .row{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:10px}
+  label.f{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--sub)}
+  input[type=text],select{border:1px solid #c9d3d6;border-radius:8px;padding:7px 10px;font-size:14px;font-family:inherit;background:#fff}
+  input[type=text]:focus,select:focus{outline:2px solid var(--teal);border-color:var(--teal)}
+  .btn{border:0;border-radius:8px;padding:8px 16px;font-size:14px;font-family:inherit;cursor:pointer;background:var(--teal);color:#fff;font-weight:700}
+  .btn:hover{background:var(--teal-d)}
+  .btn.ghost{background:#fff;color:var(--teal-d);border:1px solid var(--teal)}
+  .btn.danger{background:var(--coral)}
+  .btn.sm{padding:4px 10px;font-size:12px}
+  .btn:disabled{opacity:.5;cursor:default}
+  table{border-collapse:collapse;width:100%}
+  th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top;font-size:13px}
+  th{background:#fbfdfd;color:var(--sub);font-weight:700;position:sticky;top:0}
+  .scroll{max-height:420px;overflow:auto;border:1px solid var(--line);border-radius:8px}
+  .mono{font-family:Consolas,"Courier New",monospace}
+  .chip{display:inline-block;border-radius:10px;padding:0 8px;font-size:11px;font-weight:700;white-space:nowrap}
+  .chip.exact{background:var(--teal-l);color:var(--teal-d)}
+  .chip.near{background:var(--sun-l);color:#a96d00}
+  .chip.none{background:var(--coral-l);color:#c0392b}
+  .hint{font-size:12px;color:var(--sub);margin:4px 0 0}
+  .muted{color:var(--sub)}
+  .note{background:var(--sun-l);border:1px solid #ffd56a;border-radius:8px;padding:8px 12px;font-size:13px;margin:8px 0}
+  .warn{background:var(--coral-l);border:1px solid #f7a79e;border-radius:8px;padding:8px 12px;font-size:13px;margin:8px 0}
+  #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--ink);color:#fff;padding:10px 18px;border-radius:20px;font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:20;max-width:90%}
+  #toast.show{opacity:.95}
+  #toast.err{background:#c0392b}
+  #busy{position:fixed;inset:0;background:rgba(255,255,255,.55);display:none;align-items:center;justify-content:center;z-index:15;font-weight:700;color:var(--teal-d)}
+  #busy.show{display:flex}
+  .colsel td.pick{background:var(--teal-l)}
+  .radio{display:flex;gap:16px;font-size:13px}
+  #login{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:12}
+  #login .box{background:#fff;border:1px solid var(--line);border-radius:16px;padding:28px 32px;width:360px;box-shadow:0 8px 24px rgba(0,0,0,.06);text-align:center}
+  #login h2{margin:6px 0 4px;font-size:18px}
+  #login input[type=password]{width:100%;margin:16px 0 10px;font-size:16px;padding:10px 12px;border:1px solid #c9d3d6;border-radius:8px}
+  #login .err{color:#c0392b;font-size:13px;min-height:1.4em;margin-top:8px}
+  .hidden{display:none !important}
+  .search-box{background:var(--teal-l);border-radius:10px;padding:10px 12px;margin-bottom:12px}
+  .search-box .scroll{background:#fff}
+  .divider{display:flex;align-items:center;gap:10px;color:var(--sub);font-size:12px;margin:4px 0 12px}
+  .divider::before,.divider::after{content:"";flex:1;border-top:1px dashed #c9d3d6}
+  .sub2{font-size:11px;color:var(--sub)}
+  .chip.adopted{background:#e8eaf6;color:#3949ab}
+  .chip.kind{background:#f1f4f6;color:var(--sub)}
+  tr.picked td{background:var(--sun-l)}
+</style>
+</head>
+<body>
+<header>
+  <div style="font-size:26px">🛰️</div>
+  <div>
+    <h1>供給メールレーダー　採用薬の管理</h1>
+    <div class="sheet" id="sheetName"></div>
+  </div>
+  <div style="margin-left:auto;display:flex;gap:8px">
+    <button class="btn ghost sm" style="background:#fff" onclick="reload()">🔄 再読み込み</button>
+    <button class="btn ghost sm" style="background:#fff" onclick="logout()">🚪 ログアウト</button>
+  </div>
+</header>
+
+<main>
+  <!-- 件数 -->
+  <div class="stats">
+    <div class="stat"><div class="k">💊 採用薬</div><div class="v" id="stCount">-</div><div class="s" id="stCountSub">&nbsp;</div></div>
+    <div class="stat"><div class="k">📖 医薬品一覧との照合</div><div class="v" id="stMatch">-</div><div class="s" id="stMatchSub">&nbsp;</div></div>
+    <div class="stat"><div class="k">🕒 最終更新</div><div class="v" id="stLast" style="font-size:18px;padding-top:6px">-</div><div class="s">この画面からの更新</div></div>
+  </div>
+
+  <!-- 一覧 -->
+  <details class="card" id="cardList">
+    <summary>📋 採用薬一覧 <span class="muted" id="listCount" style="font-weight:400;font-size:13px"></span></summary>
+    <div class="body">
+      <div class="row">
+        <label class="f" style="flex:1">🔍 検索（YJコード・薬品名・規格・メモ）
+          <input type="text" id="q" placeholder="例：アムロジピン、2171022" oninput="renderList()">
+        </label>
+        <label class="f">照合状況
+          <select id="fSt" onchange="renderList()">
+            <option value="">すべて</option>
+            <option value="exact">一覧と一致</option>
+            <option value="near">上9桁のみ一致</option>
+            <option value="none">一覧に該当なし</option>
+          </select>
+        </label>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th style="width:120px">YJコード</th><th>薬品名</th><th style="width:140px">規格</th><th>メモ</th><th style="width:90px">照合</th><th style="width:120px"></th></tr></thead>
+          <tbody id="listBody"></tbody>
+        </table>
+      </div>
+      <div class="hint" id="listMore"></div>
+    </div>
+  </details>
+
+  <!-- 個別追加 -->
+  <details class="card">
+    <summary>➕ 採用薬を1件追加</summary>
+    <div class="body">
+      <div class="search-box">
+        <div class="row" style="margin-bottom:6px">
+          <label class="f" style="flex:1">🔍 医薬品一覧から探す（品名・成分名・メーカー・規格・YJコード。スペースで区切ると絞り込み）
+            <input type="text" id="mq" placeholder="例：アムロジピン 5mg ／ あむろ 沢井" onkeydown="if(event.key==='Enter')searchMaster()">
+          </label>
+          <button class="btn" onclick="searchMaster()">検索</button>
+        </div>
+        <div class="hint" id="mInfo"></div>
+        <div class="scroll" id="mWrap" style="max-height:300px;margin-top:6px;display:none">
+          <table>
+            <thead><tr><th>品名</th><th style="width:130px">規格</th><th style="width:150px">メーカー</th><th style="width:110px">YJコード</th><th style="width:150px"></th></tr></thead>
+            <tbody id="mBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="divider"><span>または YJコードを直接入力</span></div>
+      <div class="row">
+        <label class="f">YJコード（12桁）<input type="text" id="aCode" class="mono" style="width:160px" placeholder="1169017F1025" onblur="lookup()"></label>
+        <button class="btn ghost sm" onclick="lookup(true)">📖 医薬品一覧から入力</button>
+        <span class="hint" id="aLookup"></span>
+      </div>
+      <div class="row">
+        <label class="f" style="flex:2">薬品名<input type="text" id="aName"></label>
+        <label class="f" style="flex:1">規格<input type="text" id="aSpec"></label>
+      </div>
+      <div class="row">
+        <label class="f" style="flex:1">メモ（加工メールに表示されます・空欄OK）<input type="text" id="aMemo" placeholder="例：粉砕不可"></label>
+        <button class="btn" onclick="addOne()">追加する</button>
+      </div>
+      <p class="hint">💡 検索結果の「選ぶ」で下の欄に入るので、薬品名を院内の名前に直してから追加できます。「すぐ追加」は医薬品一覧の品名のまま追加します。</p>
+    </div>
+  </details>
+
+  <!-- 採用薬一括アップロード -->
+  <details class="card">
+    <summary>📤 採用薬一括アップロード（CSV・Excel）</summary>
+    <div class="body">
+      <div class="row">
+        <label class="f">ファイル（.csv / .xlsx / .xls）<input type="file" id="upFile" accept=".csv,.txt,.xlsx,.xls" onchange="readFile()"></label>
+        <label class="f">文字コード（CSVのみ）
+          <select id="upEnc" onchange="readFile()">
+            <option value="auto">自動判定</option>
+            <option value="utf-8">UTF-8</option>
+            <option value="shift_jis">Shift_JIS</option>
+          </select>
+        </label>
+        <label class="f" style="flex-direction:row;align-items:center;gap:6px;color:var(--ink)"><input type="checkbox" id="upHeader" checked onchange="renderPreview()">1行目は見出し</label>
+      </div>
+      <div id="upArea" style="display:none">
+        <div class="row" id="sheetPick" style="display:none">
+          <label class="f">シート<select id="upSheet" onchange="pickSheet()"></select></label>
+        </div>
+        <div class="row">
+          <label class="f">🔢 YJコードの列<select id="cCode" onchange="renderPreview()"></select></label>
+          <label class="f">💊 薬品名の列<select id="cName" onchange="renderPreview()"></select></label>
+          <label class="f">📏 規格の列<select id="cSpec" onchange="renderPreview()"></select></label>
+          <label class="f">📝 メモの列<select id="cMemo" onchange="renderPreview()"></select></label>
+        </div>
+        <div class="hint" id="upStat"></div>
+        <div class="scroll" style="max-height:220px;margin:8px 0"><table class="colsel"><tbody id="upPrev"></tbody></table></div>
+        <div class="radio">
+          <label><input type="radio" name="upMode" value="replace" checked> 🔁 置換（今の採用薬をすべて入れ替える）</label>
+          <label><input type="radio" name="upMode" value="append"> ➕ 追加（登録済みのコードはスキップ）</label>
+        </div>
+        <div class="row" style="margin-top:10px"><button class="btn" id="upBtn" onclick="upload()">アップロードする</button></div>
+        <div class="note">💾 アップロード前の採用薬は自動でバックアップされます。間違えたときは「⏪ ロールバック」で戻せます。</div>
+      </div>
+      <div id="upResult"></div>
+    </div>
+  </details>
+
+  <!-- 一括ダウンロード -->
+  <details class="card">
+    <summary>📥 一括ダウンロード</summary>
+    <div class="body">
+      <div class="row">
+        <button class="btn" onclick="downloadCsv()">CSVをダウンロード</button>
+        <button class="btn ghost" onclick="exportDrive()">Googleドライブに保存</button>
+      </div>
+      <p class="hint">CSVはExcelで開いても文字化けしない形式（UTF-8 BOM付き）です。ダウンロードできないときは「Googleドライブに保存」を使ってください。</p>
+      <div id="dlResult"></div>
+    </div>
+  </details>
+
+  <!-- 医薬品一覧アップロード -->
+  <details class="card">
+    <summary>📚 医薬品一覧アップロード <span class="muted" id="mstInfo" style="font-weight:400;font-size:13px"></span></summary>
+    <div class="body">
+      <p style="margin-top:0">DSJPのメールの品名からYJコードを調べる「医薬品一覧」を、厚生労働省の<b>薬価基準収載品目リスト</b>で更新します。</p>
+      <ol style="margin:0 0 10px;padding-left:20px;line-height:1.8">
+        <li>厚生労働省のページ
+          <a href="https://www.mhlw.go.jp/stf/seisakunitsuite/bunya/0000078916.html" target="_blank" rel="noopener">🔗 医療保険が適用される医薬品について｜厚生労働省</a>
+          を開く</li>
+        <li>「薬価基準収載品目リストについて」の最新の日付のページを開く</li>
+        <li><b>内用薬（_01）・注射薬（_02）・外用薬（_03）</b>のExcelをダウンロードする（歯科用薬剤（_04）は任意）</li>
+        <li>下の「ファイル」で、ダウンロードしたファイルを<b>まとめて選ぶ</b>（Ctrlを押しながらクリック）</li>
+      </ol>
+      <div class="note">📝 ファイル名は <span class="mono">tp20261014-01_01.xlsx</span> のような形です。区分ごとに日付が違うことがありますが、そのまま選んでOKです。「その他（_05）」「除外品目（_06）」は形式が違うので使いません。</div>
+      <div class="row">
+        <label class="f">ファイル（.xlsx・複数選択可）<input type="file" id="mstFile" accept=".xlsx,.xls" multiple onchange="readMasterFiles()"></label>
+      </div>
+      <div id="mstArea" style="display:none">
+        <table style="margin-bottom:10px">
+          <thead><tr><th>ファイル</th><th style="width:110px">種類</th><th style="width:110px">件数</th><th>状態</th></tr></thead>
+          <tbody id="mstFiles"></tbody>
+        </table>
+        <div class="hint" id="mstWarn"></div>
+        <div class="radio" style="margin-top:8px">
+          <label><input type="radio" name="mstMode" value="merge" checked> 🔁 追記・更新（おすすめ：今の一覧にしかない古い品目も残す）</label>
+          <label><input type="radio" name="mstMode" value="replace"> 🧹 置き換え（今の一覧を消して入れ直す）</label>
+        </div>
+        <div class="row" style="margin-top:10px"><button class="btn" id="mstBtn" onclick="uploadMaster()">医薬品一覧を取り込む</button></div>
+        <p class="hint">💡 経過措置が切れて新しいリストから消えた品目も、販売中止の通知が後から届くことがあります。ふだんは「追記・更新」を使ってください。取り込みには数十秒かかることがあります。</p>
+      </div>
+      <div id="mstResult"></div>
+      <div id="mstRestore"></div>
+    </div>
+  </details>
+
+  <!-- 更新履歴 -->
+  <details class="card">
+    <summary>🕒 更新履歴 <span class="muted" style="font-weight:400;font-size:13px">（直近50件）</span></summary>
+    <div class="body">
+      <div class="scroll" style="max-height:320px">
+        <table>
+          <thead><tr><th style="width:150px">日時</th><th style="width:90px">操作</th><th style="width:90px">件数</th><th>内容</th><th style="width:170px">実行者</th></tr></thead>
+          <tbody id="histBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </details>
+
+  <!-- ロールバック -->
+  <details class="card">
+    <summary>⏪ ロールバック <span class="muted" id="genInfo" style="font-weight:400;font-size:13px"></span></summary>
+    <div class="body">
+      <p class="hint" style="margin-top:0">採用薬を更新するたびに、更新直前の状態を別シート（非表示）に保存しています。戻したい時点を選んでください。</p>
+      <table>
+        <thead><tr><th>保存日時（この時刻の直前の状態）</th><th style="width:100px">件数</th><th style="width:160px"></th></tr></thead>
+        <tbody id="bkBody"></tbody>
+      </table>
+      <div class="warn">⚠️ 戻すと、今の採用薬もバックアップに残ります（いちばん古いバックアップが消えます）。</div>
+    </div>
+  </details>
+</main>
+
+<div id="login">
+  <div class="box">
+    <div style="font-size:40px">🛰️</div>
+    <h2>供給メールレーダー</h2>
+    <div class="muted" style="font-size:13px">採用薬の管理画面</div>
+    <input type="password" id="pw" placeholder="パスワード" autocomplete="current-password" onkeydown="if(event.key==='Enter')login()">
+    <label style="display:flex;align-items:center;gap:6px;justify-content:center;font-size:13px;margin-bottom:14px">
+      <input type="checkbox" id="remember" checked> このブラウザにログイン状態を保存する
+    </label>
+    <button class="btn" style="width:100%" onclick="login()">ログイン</button>
+    <div class="err" id="loginErr"></div>
+    <p class="hint">共用のパソコンでは保存のチェックを外してください。</p>
+  </div>
+</div>
+
+<div id="busy">⏳ 処理中…</div>
+<div id="toast"></div>
+
+<script>
+let S = null;          // サーバーからの状態
+let LIMIT = 300;       // 一覧の表示件数
+let UP = { sheets: null, rows: [], name: '' };
+
+// ---------- 共通 ----------
+// ---------- ログイン ----------
+const TOKEN_KEY = 'dsjpRadarAdminToken';
+let TOKEN = '';
+function store() { try { return window.localStorage; } catch (e) { return null; } }
+function loadToken() { try { return (store() && store().getItem(TOKEN_KEY)) || ''; } catch (e) { return ''; } }
+function saveToken(t) { try { store() && store().setItem(TOKEN_KEY, t); } catch (e) {} }
+function clearToken() { try { store() && store().removeItem(TOKEN_KEY); } catch (e) {} }
+function showLogin(msg, info) {
+  TOKEN = ''; S = null;
+  document.getElementById('login').classList.remove('hidden');
+  const el = document.getElementById('loginErr');
+  el.textContent = msg || '';
+  el.style.color = info ? 'var(--teal-d)' : '';
+  document.getElementById('pw').value = '';
+  setTimeout(() => document.getElementById('pw').focus(), 50);
+}
+function login() {
+  const pw = document.getElementById('pw').value;
+  if (!pw) { document.getElementById('loginErr').textContent = 'パスワードを入れてください'; return; }
+  busy(true);
+  google.script.run
+    .withSuccessHandler(r => {
+      busy(false);
+      TOKEN = r.token;
+      if (document.getElementById('remember').checked) saveToken(TOKEN); else clearToken();
+      document.getElementById('login').classList.add('hidden');
+      reload();
+    })
+    .withFailureHandler(e => { busy(false); const el = document.getElementById('loginErr'); el.style.color = ''; el.textContent = e.message || String(e); })
+    .admLogin(pw);
+}
+function logout() {
+  if (!confirm('ログアウトします。このブラウザに保存したログイン状態も消えます。')) return;
+  clearToken();
+  showLogin('👋 ログアウトしました', true);
+}
+
+// ---------- 通信 ----------
+function call(fn, ...args) {
+  return new Promise(res => {
+    busy(true);
+    google.script.run
+      .withSuccessHandler(v => { busy(false); res(v); })
+      .withFailureHandler(e => {
+        busy(false);
+        const m = (e && e.message) || String(e);
+        if (m.indexOf('AUTH:') >= 0) { clearToken(); showLogin('もう一度ログインしてください（パスワードが変更された可能性があります）'); }
+        else toast(m, true);
+        // エラー時は呼び出し元の処理を進めない（rejectしない）
+      })[fn](TOKEN, ...args);
+  });
+}
+// ---------- 共通 ----------
+function busy(on) { document.getElementById('busy').classList.toggle('show', on); }
+let toastTimer;
+function toast(m, err) {
+  const t = document.getElementById('toast');
+  t.textContent = m; t.className = 'show' + (err ? ' err' : '');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = '', err ? 6000 : 3000);
+}
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function norm(s) { return String(s == null ? '' : s).normalize('NFKC').replace(/\s/g, '').toUpperCase(); }
+function colName(i) { let s = ''; i++; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; }
+const YJ = /^[0-9]{7}[A-Z][0-9A-Z]{4}$/;
+
+// ---------- 状態 ----------
+function apply(st) {
+  S = st;
+  if (st.message) toast(st.message);
+  document.getElementById('sheetName').textContent = st.sheetName || '';
+  document.getElementById('stCount').innerHTML = st.count + '<small> 件</small>';
+  if (st.match) {
+    const pct = st.count ? Math.round(st.match.exact / st.count * 100) : 0;
+    document.getElementById('stMatch').innerHTML = pct + '<small> %</small>';
+    document.getElementById('stMatchSub').textContent = '一致 ' + st.match.exact + '／上9桁 ' + st.match.near + '／該当なし ' + st.match.none;
+  } else {
+    document.getElementById('stMatch').textContent = '—';
+    document.getElementById('stMatchSub').textContent = st.masterError || '';
+  }
+  document.getElementById('stLast').textContent = st.lastUpdate || '—';
+  renderList(); renderHistory(); renderBackups(); renderMasterInfo();
+}
+function reload() { call('admGetState').then(apply); }
+
+// ---------- 一覧 ----------
+function renderList() {
+  if (!S) return;
+  const q = norm(document.getElementById('q').value);
+  const f = document.getElementById('fSt').value;
+  const hit = S.list.filter(r => (!f || r.st === f) && (!q || norm(r.code + r.name + r.spec + r.memo).includes(q)));
+  const label = { exact: '一覧と一致', near: '上9桁のみ', none: '該当なし' };
+  document.getElementById('listCount').textContent = '（' + (hit.length === S.list.length ? S.list.length + '件' : hit.length + ' / ' + S.list.length + '件') + '）';
+  document.getElementById('listBody').innerHTML = hit.slice(0, LIMIT).map(r =>
+    '<tr><td class="mono">' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td>' + esc(r.spec) + '</td>' +
+    '<td>' + esc(r.memo) + '</td><td>' + (r.st ? '<span class="chip ' + r.st + '">' + label[r.st] + '</span>' : '') + '</td>' +
+    '<td><button class="btn ghost sm" onclick="editMemo(\'' + r.code + '\')">📝</button> ' +
+    '<button class="btn danger sm" onclick="delOne(\'' + r.code + '\')">削除</button></td></tr>').join('') ||
+    '<tr><td colspan="6" class="muted">該当する採用薬はありません</td></tr>';
+  document.getElementById('listMore').innerHTML = hit.length > LIMIT ?
+    '先頭 ' + LIMIT + ' 件を表示中。<a href="#" onclick="LIMIT+=500;renderList();return false">さらに表示</a>（検索で絞り込むと速いです）' : '';
+}
+function delOne(code) {
+  const r = S.list.find(x => x.code === code);
+  if (!confirm('「' + (r ? r.name : code) + '」を採用薬から削除します。よろしいですか？')) return;
+  call('admDelete', code).then(apply);
+}
+function editMemo(code) {
+  const r = S.list.find(x => x.code === code);
+  const v = prompt('「' + r.name + '」のメモ', r.memo || '');
+  if (v === null) return;
+  call('admUpdateMemo', code, v).then(apply);
+}
+
+// ---------- 個別追加 ----------
+let lastLookup = '';
+function lookup(force) {
+  const code = norm(document.getElementById('aCode').value);
+  document.getElementById('aCode').value = code;
+  const out = document.getElementById('aLookup');
+  if (!code) { out.textContent = ''; return; }
+  if (!YJ.test(code)) { out.textContent = '⚠️ 12桁のYJコードを入れてください'; return; }
+  if (!force && code === lastLookup) return;
+  lastLookup = code;
+  if (S && S.list.some(r => r.code === code)) { out.textContent = '⚠️ このコードはすでに登録されています'; return; }
+  call('admLookup', code).then(r => {
+    if (!r.ok) { out.textContent = '🤔 ' + r.message; return; }
+    const n = document.getElementById('aName'), s = document.getElementById('aSpec');
+    if (force || !n.value) n.value = r.name;
+    if (force || !s.value) s.value = r.spec;
+    out.textContent = r.exact ? '✅ 医薬品一覧から入力しました' + (r.maker ? '（' + r.maker + '）' : '') : '🔍 同規格の他銘柄の情報を入れました。薬品名を確認してください';
+  });
+}
+function addOne() {
+  const rec = { code: norm(document.getElementById('aCode').value), name: document.getElementById('aName').value,
+    spec: document.getElementById('aSpec').value, memo: document.getElementById('aMemo').value };
+  if (!YJ.test(rec.code)) return toast('12桁のYJコードを入れてください', true);
+  if (!rec.name.trim()) return toast('薬品名を入れてください', true);
+  call('admAdd', rec).then(st => {
+    ['aCode', 'aName', 'aSpec', 'aMemo'].forEach(id => document.getElementById(id).value = '');
+    document.getElementById('aLookup').textContent = ''; lastLookup = '';
+    apply(st);
+  });
+}
+
+// ---------- 医薬品一覧から探す ----------
+let M = [];
+function searchMaster() {
+  const q = document.getElementById('mq').value.trim();
+  if (!q) { toast('探したい品名などを入れてください', true); return; }
+  call('admSearchMaster', q, 100).then(r => {
+    M = r.items;
+    const info = document.getElementById('mInfo');
+    info.textContent = r.total ? (r.total > r.items.length ? r.total + ' 件見つかりました（先頭 ' + r.items.length + ' 件を表示。語を足すと絞り込めます）' : r.total + ' 件見つかりました')
+      : '見つかりませんでした。カタカナの一部や成分名でも探せます';
+    document.getElementById('mWrap').style.display = r.items.length ? '' : 'none';
+    document.getElementById('mBody').innerHTML = r.items.map((m, i) =>
+      '<tr id="mrow' + i + '"><td><b>' + esc(m.name) + '</b>' +
+      (m.kind ? ' <span class="chip kind">' + esc(m.kind) + '</span>' : '') +
+      (m.adopted ? ' <span class="chip adopted">採用済み</span>' : '') +
+      '<div class="sub2">' + esc(m.gen) + (m.kubun ? '　' + esc(m.kubun) : '') + (m.price ? '　薬価 ' + esc(m.price) : '') + '</div></td>' +
+      '<td>' + esc(m.spec) + '</td><td>' + esc(m.maker) + '</td><td class="mono">' + esc(m.code) + '</td>' +
+      '<td>' + (m.adopted ? '<span class="muted" style="font-size:12px">登録済み</span>' :
+        '<button class="btn ghost sm" onclick="pickMaster(' + i + ')">選ぶ</button> <button class="btn sm" onclick="quickAdd(' + i + ')">すぐ追加</button>') + '</td></tr>').join('');
+  });
+}
+function pickMaster(i) {
+  const m = M[i];
+  document.getElementById('aCode').value = m.code;
+  document.getElementById('aName').value = m.name;
+  document.getElementById('aSpec').value = m.spec;
+  lastLookup = m.code;
+  document.getElementById('aLookup').textContent = '✅ 医薬品一覧から入力しました' + (m.maker ? '（' + m.maker + '）' : '') + '。薬品名を確認して「追加する」を押してください';
+  document.querySelectorAll('#mBody tr').forEach(tr => tr.classList.remove('picked'));
+  document.getElementById('mrow' + i).classList.add('picked');
+  document.getElementById('aName').focus();
+}
+function quickAdd(i) {
+  const m = M[i];
+  if (!confirm('「' + m.name + '」（' + m.code + '）を採用薬に追加します。よろしいですか？')) return;
+  call('admAdd', { code: m.code, name: m.name, spec: m.spec, memo: '' }).then(st => {
+    m.adopted = true;
+    apply(st);
+    searchMaster(); // 「採用済み」を反映
+  });
+}
+
+// ---------- 医薬品一覧アップロード ----------
+const MST_KIND = { '01': '内用薬', '02': '注射薬', '03': '外用薬', '04': '歯科用薬剤' };
+let MST = [];
+function hnorm(s) { return String(s == null ? '' : s).normalize('NFKC').replace(/\s/g, ''); }
+function readMasterFiles() {
+  const files = Array.from(document.getElementById('mstFile').files);
+  document.getElementById('mstResult').innerHTML = '';
+  MST = [];
+  if (!files.length) { document.getElementById('mstArea').style.display = 'none'; return; }
+  if (typeof XLSX === 'undefined') { toast('Excelの読み込み部品が使えません。ネットワークを確認してください', true); return; }
+  busy(true);
+  Promise.all(files.map(f => new Promise(res => {
+    const fr = new FileReader();
+    fr.onload = () => res(parseMasterFile(f.name, new Uint8Array(fr.result)));
+    fr.onerror = () => res({ name: f.name, error: '読み込めませんでした' });
+    fr.readAsArrayBuffer(f);
+  }))).then(list => {
+    busy(false);
+    MST = list;
+    renderMasterFiles();
+  });
+}
+function parseMasterFile(name, bytes) {
+  const m = name.match(/_(0\d)\.xlsx?$/i);
+  const no = m ? m[1] : '';
+  if (no === '05' || no === '06') return { name, error: 'このファイル（_' + no + '）は形式が違うので使いません' };
+  try {
+    const wb = XLSX.read(bytes, { type: 'array' });
+    for (const sn of wb.SheetNames) {
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, raw: false, defval: '' });
+      const hi = rows.slice(0, 20).findIndex(r => r.some(c => hnorm(c) === '薬価基準収載医薬品コード'));
+      if (hi < 0) continue;
+      const h = rows[hi].map(hnorm);
+      const exact = t => h.indexOf(t);
+      const has = (...ts) => h.findIndex(x => ts.every(t => x.indexOf(t) >= 0));
+      const col = [
+        exact('区分'), exact('薬価基準収載医薬品コード'), exact('成分名'), exact('規格'), exact('品名'), exact('メーカー名'),
+        has('後発医薬品', '算定対象'), exact('先発医薬品'), has('同一剤形', '先発医薬品'), exact('薬価'), has('経過措置'), exact('備考')
+      ];
+      if (col[1] < 0 || col[4] < 0) continue;
+      const out = [];
+      for (let i = hi + 1; i < rows.length; i++) {
+        const r = rows[i];
+        const code = hnorm(r[col[1]]).toUpperCase();
+        if (!YJ.test(code)) continue;
+        out.push(col.map(j => j < 0 ? '' : String(r[j] == null ? '' : r[j]).trim()));
+      }
+      const kubun = out.length ? out[0][0] : '';
+      return { name, no, kind: MST_KIND[no] || kubun || '不明', rows: out, missing: [col[2], col[3], col[5], col[9]].some(j => j < 0) };
+    }
+    return { name, error: '「薬価基準収載医薬品コード」の見出しが見つかりません' };
+  } catch (e) { return { name, error: '読み込めませんでした：' + e.message }; }
+}
+function renderMasterFiles() {
+  document.getElementById('mstArea').style.display = '';
+  document.getElementById('mstFiles').innerHTML = MST.map(f =>
+    '<tr><td class="mono" style="font-size:12px">' + esc(f.name) + '</td><td>' + esc(f.kind || '—') + '</td><td>' +
+    (f.rows ? f.rows.length.toLocaleString() + ' 件' : '—') + '</td><td>' +
+    (f.error ? '<span class="chip none">❌ ' + esc(f.error) + '</span>' :
+      (f.rows.length ? '<span class="chip exact">✅ OK</span>' + (f.missing ? ' <span class="chip near">一部の列なし</span>' : '') : '<span class="chip none">品目がありません</span>')) +
+    '</td></tr>').join('');
+  const ok = MST.filter(f => f.rows && f.rows.length);
+  const have = new Set(ok.map(f => f.no));
+  const lack = ['01', '02', '03'].filter(n => !have.has(n)).map(n => MST_KIND[n]);
+  const dup = ok.map(f => f.no).filter((n, i, a) => n && a.indexOf(n) !== i);
+  const total = ok.reduce((a, f) => a + f.rows.length, 0);
+  document.getElementById('mstWarn').innerHTML =
+    '合計 <b>' + total.toLocaleString() + '</b> 件' +
+    (lack.length ? '<br>⚠️ ' + lack.join('・') + ' のファイルがありません（「追記・更新」なら、その区分は今の一覧のまま残ります）' : '') +
+    (dup.length ? '<br>⚠️ 同じ種類のファイルが2つ以上あります。新しい日付のものだけを選ぶのがおすすめです' : '');
+  document.getElementById('mstBtn').disabled = !ok.length;
+}
+function uploadMaster() {
+  const ok = MST.filter(f => f.rows && f.rows.length);
+  if (!ok.length) return;
+  const mode = document.querySelector('input[name=mstMode]:checked').value;
+  const total = ok.reduce((a, f) => a + f.rows.length, 0);
+  const msg = (mode === 'replace' ? '今の医薬品一覧を消して、' : '今の医薬品一覧に、') + total.toLocaleString() + ' 件を取り込みます。よろしいですか？';
+  if (!confirm(msg)) return;
+  call('admUploadMaster', { files: ok.map(f => ({ name: f.name, kind: f.kind, rows: f.rows })), mode }).then(st => {
+    const r = st.masterResult;
+    document.getElementById('mstResult').innerHTML = '<div class="note">🎉 医薬品一覧を取り込みました：全 <b>' + r.total.toLocaleString() + '</b> 件<br>' +
+      '🆕 追加 ' + r.added.toLocaleString() + ' 件　🔁 更新 ' + r.updated.toLocaleString() + ' 件　' +
+      (r.mode === 'merge' ? '📦 以前の品目を保持 ' + r.kept.toLocaleString() + ' 件' : '🧹 削除 ' + r.removed.toLocaleString() + ' 件') + '</div>';
+    document.getElementById('mstFile').value = ''; document.getElementById('mstArea').style.display = 'none'; MST = [];
+    apply(st);
+  });
+}
+function restoreMaster() {
+  if (!confirm('医薬品一覧を、前回の取り込みの直前の状態に戻します。よろしいですか？')) return;
+  call('admRestoreMaster').then(st => { document.getElementById('mstResult').innerHTML = ''; apply(st); });
+}
+function renderMasterInfo() {
+  const mi = S.masterInfo || {};
+  document.getElementById('mstInfo').textContent = '（' + (mi.count || 0).toLocaleString() + '件' +
+    (mi.info ? '・最終取り込み ' + mi.info.at : '') + '）';
+  document.getElementById('mstRestore').innerHTML = mi.hasBackup ?
+    '<div class="row" style="margin-top:8px"><button class="btn ghost sm" onclick="restoreMaster()">⏪ 前回の取り込みの前に戻す</button>' +
+    '<span class="hint">取り込み直前の医薬品一覧を1世代だけ残しています</span></div>' : '';
+}
+
+// ---------- 採用薬一括アップロード ----------
+function readFile() {
+  const f = document.getElementById('upFile').files[0];
+  document.getElementById('upResult').innerHTML = '';
+  if (!f) return;
+  UP.name = f.name;
+  const isXls = /\.xlsx?$/i.test(f.name);
+  const fr = new FileReader();
+  fr.onload = () => {
+    try {
+      if (isXls) {
+        if (typeof XLSX === 'undefined') throw new Error('Excelの読み込み部品が使えません。CSVで保存してアップロードしてください');
+        const wb = XLSX.read(new Uint8Array(fr.result), { type: 'array' });
+        UP.sheets = {};
+        wb.SheetNames.forEach(n => UP.sheets[n] = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: false, defval: '' }));
+        const sel = document.getElementById('upSheet');
+        sel.innerHTML = wb.SheetNames.map(n => '<option>' + esc(n) + '</option>').join('');
+        document.getElementById('sheetPick').style.display = wb.SheetNames.length > 1 ? '' : 'none';
+        UP.rows = UP.sheets[wb.SheetNames[0]];
+      } else {
+        UP.sheets = null;
+        document.getElementById('sheetPick').style.display = 'none';
+        UP.rows = parseCsv(decode(new Uint8Array(fr.result)));
+      }
+      setupCols(); renderPreview();
+      document.getElementById('upArea').style.display = '';
+    } catch (e) { toast(e.message, true); }
+  };
+  fr.readAsArrayBuffer(f);
+}
+function pickSheet() { UP.rows = UP.sheets[document.getElementById('upSheet').value]; setupCols(); renderPreview(); }
+function decode(bytes) {
+  const enc = document.getElementById('upEnc').value;
+  if (enc === 'shift_jis') return new TextDecoder('shift_jis').decode(bytes);
+  if (enc === 'utf-8') return new TextDecoder('utf-8').decode(bytes);
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  catch (e) { return new TextDecoder('shift_jis').decode(bytes); }
+}
+function parseCsv(text) {
+  text = text.replace(/^﻿/, '');
+  const rows = []; let row = [], cell = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; }
+      else cell += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { row.push(cell); cell = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(cell); rows.push(row); row = []; cell = '';
+    } else cell += c;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter(r => r.some(x => String(x).trim() !== ''));
+}
+function setupCols() {
+  const width = Math.max(1, ...UP.rows.slice(0, 50).map(r => r.length));
+  const head = UP.rows[0] || [];
+  const opts = none => (none ? '<option value="-1">（なし）</option>' : '') +
+    Array.from({ length: width }, (_, i) => '<option value="' + i + '">' + colName(i) + '列' + (head[i] ? '：' + esc(String(head[i]).slice(0, 12)) : '') + '</option>').join('');
+  const find = (re, d) => { const i = head.findIndex(h => re.test(String(h))); return i >= 0 ? i : d; };
+  const set = (id, none, v) => { const s = document.getElementById(id); s.innerHTML = opts(none); s.value = String(Math.min(v, width - 1)); };
+  set('cCode', false, 0);                         // 既定：A列
+  set('cName', false, Math.min(1, width - 1));    // 既定：B列
+  set('cSpec', true, find(/規格/, -1));
+  set('cMemo', true, find(/メモ|備考/, -1));
+}
+function selectedItems() {
+  const start = document.getElementById('upHeader').checked ? 1 : 0;
+  const ci = id => Number(document.getElementById(id).value);
+  const [a, b, c, d] = ['cCode', 'cName', 'cSpec', 'cMemo'].map(ci);
+  const g = (r, i) => i < 0 ? '' : String(r[i] == null ? '' : r[i]).trim();
+  return UP.rows.slice(start).map(r => ({ code: norm(g(r, a)), name: g(r, b), spec: g(r, c), memo: g(r, d) }));
+}
+function renderPreview() {
+  if (!UP.rows.length) return;
+  const items = selectedItems();
+  const valid = new Set(), dup = [], bad = [];
+  items.forEach((it, i) => { if (!YJ.test(it.code)) { if (it.code) bad.push(i); } else if (valid.has(it.code)) dup.push(i); else valid.add(it.code); });
+  const empty = items.filter(it => !it.code).length;
+  document.getElementById('upStat').innerHTML =
+    '✅ 有効 <b>' + valid.size + '</b> 件　' + (bad.length ? '❌ 形式エラー ' + bad.length + ' 件　' : '') +
+    (dup.length ? '👯 重複 ' + dup.length + ' 件　' : '') + (empty ? '（空欄 ' + empty + ' 行は無視）' : '') +
+    (S ? '<br>今の採用薬 ' + S.count + ' 件 → 置換すると ' + valid.size + ' 件' : '');
+  const picks = ['cCode', 'cName', 'cSpec', 'cMemo'].map(id => Number(document.getElementById(id).value));
+  const width = Math.max(1, ...UP.rows.slice(0, 50).map(r => r.length));
+  const head = '<tr>' + Array.from({ length: width }, (_, i) => '<th>' + colName(i) + '</th>').join('') + '</tr>';
+  document.getElementById('upPrev').innerHTML = head + UP.rows.slice(0, 8).map((r, ri) =>
+    '<tr>' + Array.from({ length: width }, (_, i) => '<td class="' + (picks.includes(i) ? 'pick' : '') + '"' +
+      (ri === 0 && document.getElementById('upHeader').checked ? ' style="font-weight:700"' : '') + '>' + esc(r[i]) + '</td>').join('') + '</tr>').join('');
+  document.getElementById('upBtn').disabled = !valid.size;
+}
+function upload() {
+  const mode = document.querySelector('input[name=upMode]:checked').value;
+  const items = selectedItems().filter(it => it.code);
+  const msg = mode === 'replace' ? '今の採用薬（' + S.count + '件）をすべて入れ替えます。よろしいですか？' : '採用薬に追加します。よろしいですか？';
+  if (!confirm(msg)) return;
+  call('admUpload', items, mode, UP.name).then(st => {
+    const r = st.uploadResult;
+    document.getElementById('upResult').innerHTML = '<div class="note">🎉 ' + esc(st.message) +
+      (r.invalidCount ? '<br>❌ 形式エラーで除外した行（データ行の番号）：' + r.invalidRows.join(', ') + (r.invalidCount > r.invalidRows.length ? ' ほか' : '') : '') +
+      (r.dupInFile ? '<br>👯 ファイル内の重複 ' + r.dupInFile + ' 件は1件にまとめました' : '') +
+      (r.skippedExisting ? '<br>⏭️ 登録済みの ' + r.skippedExisting + ' 件はスキップしました' : '') + '</div>';
+    document.getElementById('upFile').value = ''; document.getElementById('upArea').style.display = 'none'; UP.rows = [];
+    apply(st);
+  });
+}
+
+// ---------- 一括ダウンロード ----------
+function csvText() {
+  const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  return '﻿' + [['YJコード', '薬品名', '規格', 'メモ']].concat(S.list.map(r => [r.code, r.name, r.spec, r.memo]))
+    .map(r => r.map(q).join(',')).join('\r\n');
+}
+function fileStamp() { const d = new Date(); const p = n => String(n).padStart(2, '0'); return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()); }
+function downloadCsv() {
+  if (!S) return;
+  const blob = new Blob([csvText()], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = '採用薬_' + fileStamp() + '.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  toast('ダウンロードしました（' + S.list.length + '件）');
+}
+function exportDrive() {
+  call('admExportCsv').then(r => {
+    document.getElementById('dlResult').innerHTML = '<div class="note">💾 Googleドライブに保存しました：<a href="' + esc(r.url) + '" target="_blank">' + esc(r.name) + '</a></div>';
+  });
+}
+
+// ---------- 履歴・ロールバック ----------
+function renderHistory() {
+  document.getElementById('histBody').innerHTML = S.history.map(h =>
+    '<tr><td>' + esc(h.date) + '</td><td>' + esc(h.op) + '</td><td>' + esc(h.before) + ' → ' + esc(h.after) + '</td><td>' + esc(h.detail) + '</td><td class="muted">' + esc(h.who) + '</td></tr>').join('') ||
+    '<tr><td colspan="5" class="muted">まだ履歴はありません</td></tr>';
+}
+function renderBackups() {
+  document.getElementById('genInfo').textContent = '（最大 ' + S.generations + ' 世代）';
+  document.getElementById('bkBody').innerHTML = S.backups.map(b =>
+    '<tr><td>' + esc(b.label) + '</td><td>' + b.count + ' 件</td><td><button class="btn ghost sm" onclick="restore(\'' + esc(b.name) + '\',\'' + esc(b.label) + '\',' + b.count + ')">この状態に戻す</button></td></tr>').join('') ||
+    '<tr><td colspan="3" class="muted">まだバックアップはありません（最初の更新で作られます）</td></tr>';
+}
+function restore(name, label, count) {
+  if (!confirm(label + ' の状態（' + count + '件）に戻します。よろしいですか？')) return;
+  call('admRestore', name).then(apply);
+}
+
+// ---------- 起動 ----------
+TOKEN = loadToken();
+if (TOKEN) { document.getElementById('login').classList.add('hidden'); reload(); }
+else showLogin('');
+</script>
+</body>
+</html>

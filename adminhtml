@@ -37,7 +37,7 @@
   .btn:hover{background:var(--teal-d)}
   .btn.ghost{background:#fff;color:var(--teal-d);border:1px solid var(--teal)}
   .btn.danger{background:var(--coral)}
-  .btn.sm{padding:4px 10px;font-size:12px}
+  .btn.sm{padding:4px 10px;font-size:12px;white-space:nowrap}
   .btn:disabled{opacity:.5;cursor:default}
   table{border-collapse:collapse;width:100%}
   th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top;font-size:13px}
@@ -73,6 +73,15 @@
   .chip.adopted{background:#e8eaf6;color:#3949ab}
   .chip.kind{background:#f1f4f6;color:var(--sub)}
   tr.picked td{background:var(--sun-l)}
+  .linkish{color:var(--teal-d);text-decoration:underline;cursor:pointer;font-weight:700}
+  #fix{position:fixed;inset:0;background:rgba(31,45,61,.45);display:flex;align-items:flex-start;justify-content:center;z-index:13;padding:30px 16px;overflow:auto}
+  #fix .panel{background:#fff;border-radius:14px;width:100%;max-width:980px;padding:18px 20px;box-shadow:0 10px 30px rgba(0,0,0,.2)}
+  #fix h3{margin:0 0 10px;font-size:17px}
+  .target{background:var(--bg);border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:13px}
+  .chip.reason9{background:var(--sun-l);color:#a96d00}
+  .chip.reason7{background:#e7f0fe;color:#1a56b8}
+  .chip.reasonN{background:#f1f4f6;color:var(--sub)}
+  tr.samespec td:first-child{border-left:4px solid var(--teal)}
 </style>
 </head>
 <body>
@@ -115,7 +124,7 @@
       </div>
       <div class="scroll">
         <table>
-          <thead><tr><th style="width:120px">YJコード</th><th>薬品名</th><th style="width:140px">規格</th><th>メモ</th><th style="width:90px">照合</th><th style="width:120px"></th></tr></thead>
+          <thead><tr><th style="width:120px">YJコード</th><th>薬品名</th><th style="width:140px">規格</th><th>メモ</th><th style="width:90px">照合</th><th style="width:190px"></th></tr></thead>
           <tbody id="listBody"></tbody>
         </table>
       </div>
@@ -288,6 +297,33 @@
   </div>
 </div>
 
+<div id="fix" class="hidden">
+  <div class="panel">
+    <div style="display:flex;align-items:center;gap:10px">
+      <h3>🔧 YJコードの修正</h3>
+      <button class="btn ghost sm" style="margin-left:auto" onclick="closeFix()">✕ 閉じる</button>
+    </div>
+    <div class="target" id="fixTarget"></div>
+    <div class="hint" id="fixInfo" style="margin-bottom:6px"></div>
+    <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin:4px 0 8px">
+      <input type="checkbox" id="fixOverwrite"> 薬品名・規格も医薬品一覧の内容に置き換える（チェックなし：院内の薬品名・規格・メモはそのまま）
+    </label>
+    <div class="scroll" style="max-height:360px">
+      <table>
+        <thead><tr><th style="width:130px">候補の理由</th><th>品名</th><th style="width:120px">規格</th><th style="width:130px">メーカー</th><th style="width:110px">YJコード</th><th style="width:150px"></th></tr></thead>
+        <tbody id="fixBody"></tbody>
+      </table>
+    </div>
+    <div class="divider" style="margin-top:14px"><span>候補にないときは YJコードを直接入力</span></div>
+    <div class="row">
+      <label class="f">新しいYJコード（12桁）<input type="text" id="fixCode" class="mono" style="width:170px" onblur="fixLookup()"></label>
+      <span class="hint" id="fixLookupInfo" style="flex:1"></span>
+      <button class="btn" onclick="fixManual()">このコードにする</button>
+    </div>
+    <p class="hint">💡 左に緑の線がある候補は、規格が今の登録と同じものです。修正前の状態は自動でバックアップされるので、「⏪ ロールバック」で戻せます。</p>
+  </div>
+</div>
+
 <div id="busy">⏳ 処理中…</div>
 <div id="toast"></div>
 
@@ -371,7 +407,9 @@ function apply(st) {
   if (st.match) {
     const pct = st.count ? Math.round(st.match.exact / st.count * 100) : 0;
     document.getElementById('stMatch').innerHTML = pct + '<small> %</small>';
-    document.getElementById('stMatchSub').textContent = '一致 ' + st.match.exact + '／上9桁 ' + st.match.near + '／該当なし ' + st.match.none;
+    const lk = (k, label, n) => n ? '<span class="linkish" onclick="jumpList(\'' + k + '\')">' + label + ' ' + n + '</span>' : label + ' 0';
+    document.getElementById('stMatchSub').innerHTML = '一致 ' + st.match.exact + '／' + lk('near', '上9桁', st.match.near) + '／' + lk('none', '該当なし', st.match.none) +
+      (st.match.near + st.match.none ? '<br><span style="font-size:11px">👆 数字を押すと一覧で確認・修正できます</span>' : '');
   } else {
     document.getElementById('stMatch').textContent = '—';
     document.getElementById('stMatchSub').textContent = st.masterError || '';
@@ -392,12 +430,84 @@ function renderList() {
   document.getElementById('listBody').innerHTML = hit.slice(0, LIMIT).map(r =>
     '<tr><td class="mono">' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td>' + esc(r.spec) + '</td>' +
     '<td>' + esc(r.memo) + '</td><td>' + (r.st ? '<span class="chip ' + r.st + '">' + label[r.st] + '</span>' : '') + '</td>' +
-    '<td><button class="btn ghost sm" onclick="editMemo(\'' + r.code + '\')">📝</button> ' +
+    '<td>' + (r.st === 'near' || r.st === 'none' ? '<button class="btn sm" style="background:var(--sun);color:var(--ink)" onclick="openFix(\'' + r.code + '\')">🔧 修正</button> ' : '') +
+    '<button class="btn ghost sm" onclick="editMemo(\'' + r.code + '\')">📝</button> ' +
     '<button class="btn danger sm" onclick="delOne(\'' + r.code + '\')">削除</button></td></tr>').join('') ||
     '<tr><td colspan="6" class="muted">該当する採用薬はありません</td></tr>';
   document.getElementById('listMore').innerHTML = hit.length > LIMIT ?
     '先頭 ' + LIMIT + ' 件を表示中。<a href="#" onclick="LIMIT+=500;renderList();return false">さらに表示</a>（検索で絞り込むと速いです）' : '';
 }
+// ---------- 照合ずれの修正 ----------
+let FIX = null;
+function jumpList(st) {
+  const card = document.getElementById('cardList');
+  card.open = true;
+  document.getElementById('fSt').value = st;
+  document.getElementById('q').value = '';
+  renderList();
+  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+function openFix(code) {
+  call('admFixCandidates', code).then(r => {
+    FIX = r;
+    const t = r.target;
+    const why = t.st === 'near' ? '🟡 上9桁のみ一致：同じ成分・剤形・規格の品目はありますが、このコードそのもの（銘柄）は医薬品一覧にありません。一般名コードや旧コードの可能性があります。'
+      : t.st === 'none' ? '🔴 該当なし：このコードは医薬品一覧に見つかりません。打ち間違いか、経過措置が切れた古い品目の可能性があります。'
+      : '🟢 このコードは医薬品一覧と一致しています。';
+    document.getElementById('fixTarget').innerHTML =
+      '<div><b style="font-size:15px">' + esc(t.name) + '</b>　' + esc(t.spec) + '　<span class="mono">' + esc(t.code) + '</span></div>' +
+      (t.memo ? '<div class="muted">メモ：' + esc(t.memo) + '</div>' : '') + '<div style="margin-top:4px">' + why + '</div>';
+    document.getElementById('fixInfo').textContent = r.total ? '医薬品一覧から ' + r.total + ' 件の候補が見つかりました' + (r.total > r.candidates.length ? '（先頭 ' + r.candidates.length + ' 件を表示）' : '') + '。正しい品目の「このコードにする」を押してください。'
+      : '候補が見つかりませんでした。下の欄にYJコードを直接入れてください。' + (r.key ? '' : '');
+    const cls = { '同規格（上9桁一致）': 'reason9', '同成分（上7桁一致）': 'reason7', '名前が近い': 'reasonN' };
+    document.getElementById('fixBody').innerHTML = r.candidates.map((c, i) =>
+      '<tr class="' + (c.sameSpec ? 'samespec' : '') + '"><td><span class="chip ' + (cls[c.reason] || 'reasonN') + '">' + esc(c.reason) + '</span></td>' +
+      '<td><b>' + esc(c.name) + '</b>' + (c.kind ? ' <span class="chip kind">' + esc(c.kind) + '</span>' : '') +
+      (c.adopted ? ' <span class="chip adopted">採用済み</span>' : '') +
+      '<div class="sub2">' + esc(c.gen) + (c.price ? '　薬価 ' + esc(c.price) : '') + (c.keika ? '　⚠️ 経過措置 ' + esc(c.keika) : '') + '</div></td>' +
+      '<td>' + esc(c.spec) + '</td><td>' + esc(c.maker) + '</td><td class="mono">' + esc(c.code) + '</td>' +
+      '<td>' + (c.adopted ? '<span class="muted" style="font-size:12px">登録済み</span>' : '<button class="btn sm" onclick="fixPick(' + i + ')">このコードにする</button>') + '</td></tr>').join('') ||
+      '<tr><td colspan="6" class="muted">候補はありません</td></tr>';
+    document.getElementById('fixCode').value = '';
+    document.getElementById('fixLookupInfo').textContent = '';
+    document.getElementById('fixOverwrite').checked = false;
+    document.getElementById('fix').classList.remove('hidden');
+  });
+}
+function closeFix() { document.getElementById('fix').classList.add('hidden'); FIX = null; }
+function doReplace(newCode, name, spec, label) {
+  const t = FIX.target;
+  const over = document.getElementById('fixOverwrite').checked;
+  const msg = '「' + t.name + '」のYJコードを\n' + t.code + ' → ' + newCode + '（' + label + '）\nに変更します。' +
+    (over ? '\n薬品名・規格も医薬品一覧の内容に置き換えます。' : '\n薬品名・規格・メモはそのままです。') + '\nよろしいですか？';
+  if (!confirm(msg)) return;
+  call('admReplaceCode', t.code, over ? { code: newCode, name, spec } : { code: newCode }).then(st => { closeFix(); apply(st); });
+}
+function fixPick(i) {
+  const c = FIX.candidates[i];
+  doReplace(c.code, c.name, c.spec, c.name + (c.maker ? '／' + c.maker : ''));
+}
+let fixLast = '';
+function fixLookup() {
+  const code = norm(document.getElementById('fixCode').value);
+  document.getElementById('fixCode').value = code;
+  const out = document.getElementById('fixLookupInfo');
+  if (!code) { out.textContent = ''; return; }
+  if (!YJ.test(code)) { out.textContent = '⚠️ 12桁のYJコードを入れてください'; return; }
+  if (code === fixLast) return;
+  fixLast = code;
+  call('admLookup', code).then(r => {
+    out.textContent = !r.ok ? '🤔 ' + r.message : r.exact ? '✅ ' + r.name + '（' + r.spec + (r.maker ? '／' + r.maker : '') + '）' : '🟡 銘柄は一覧にありません（同規格：' + r.name + '）';
+    out.dataset.name = r.ok && r.exact ? r.name : ''; out.dataset.spec = r.ok && r.exact ? r.spec : '';
+  });
+}
+function fixManual() {
+  const code = norm(document.getElementById('fixCode').value);
+  if (!YJ.test(code)) { toast('12桁のYJコードを入れてください', true); return; }
+  const out = document.getElementById('fixLookupInfo');
+  doReplace(code, out.dataset.name || '', out.dataset.spec || '', out.dataset.name || '直接入力');
+}
+
 function delOne(code) {
   const r = S.list.find(x => x.code === code);
   if (!confirm('「' + (r ? r.name : code) + '」を採用薬から削除します。よろしいですか？')) return;

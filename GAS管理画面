@@ -1,0 +1,629 @@
+/**
+ * 供給メールレーダー 管理画面（サーバー側） v1.3（医薬品一覧アップロード追加）
+ * 供給メールレーダー.gs と同じプロジェクトに、別ファイルとして追加する
+ *
+ * 機能：採用薬の件数・一覧・個別追加（医薬品一覧から検索して追加も可）／削除・
+ *       採用薬一括アップロード（置換／追加）・一括ダウンロード・更新履歴・バックアップからのロールバック（初期3世代）
+ *       医薬品一覧アップロード（厚労省「薬価基準収載品目リスト」tpYYYYMMDD-01_01〜_04.xlsx の取り込み）
+ *
+ * 追加シート（自動作成）
+ *   採用薬_履歴          : 更新履歴（医薬品一覧の取り込みも記録）
+ *   採用薬_bk_yyyyMMdd_HHmmss : 更新直前の採用薬シートのコピー（非表示）
+ *   医薬品一覧_bk        : 取り込み直前の医薬品一覧のコピー（非表示・1世代）
+ *
+ * スクリプトプロパティ
+ *   ADMIN_PW           : 管理画面のパスワード（必須。未設定だと誰もログインできない）
+ *   BACKUP_GENERATIONS : 残すバックアップの世代数（任意・初期値 3）
+ *   ADMIN_TOKEN_SALT   : ログイン用の内部キー（自動作成・触らない）
+ *   MASTER_INFO        : 医薬品一覧の最終取り込み情報（自動作成・触らない）
+ */
+
+// ===== 定数 =====
+const SHEET_ADOPTED_HISTORY = '採用薬_履歴';
+const BACKUP_PREFIX = '採用薬_bk_';
+const ADOPTED_HEADER = ['YJコード', '薬品名', '規格', 'メモ'];
+const MASTER_BACKUP = '医薬品一覧_bk';
+// 医薬品一覧シートの見出し（取り込み後はこの並びで書き直す。本体は見出し名で列を探すので順番は自由）
+const MASTER_HEADER = ['区分', '薬価基準収載医薬品コード', '成分名', '規格', '品名', 'メーカー名',
+  '診療報酬において加算等の算定対象となる後発医薬品', '先発医薬品', '同一剤形・規格の後発医薬品がある先発医薬品',
+  '薬価', '経過措置による使用期限', '備考', '収載リスト'];
+const KUBUN_ORDER = ['内用薬', '注射薬', '外用薬', '歯科用薬剤'];
+
+// ===== 画面を開く =====
+function openAdmin() {
+  rememberSheetId_();
+  const html = HtmlService.createTemplateFromFile('admin').evaluate()
+    .setWidth(1100).setHeight(760);
+  SpreadsheetApp.getUi().showModalDialog(html, '供給メールレーダー 採用薬の管理');
+}
+
+// Webアプリとして公開した場合の入口
+function doGet() {
+  return HtmlService.createTemplateFromFile('admin').evaluate()
+    .setTitle('供給メールレーダー 採用薬の管理')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+// ===== パスワード認証 =====
+// ブラウザにはパスワードそのものではなく「ADMIN_PWから作った合言葉（トークン）」を保存する。
+// ADMIN_PW を変えると、保存済みのログインはすべて無効になる。
+const LOGIN_MAX_FAIL = 5;          // この回数まちがえると
+const LOGIN_LOCK_SEC = 5 * 60;     // この秒数ロック
+
+function admLogin(pw) {
+  const props = PropertiesService.getScriptProperties();
+  const real = props.getProperty('ADMIN_PW') || '';
+  if (!real) throw new Error('ADMIN_PW が設定されていません。スクリプトプロパティに設定してください');
+  const cache = CacheService.getScriptCache();
+  const fails = Number(cache.get('ADM_FAIL') || 0);
+  if (fails >= LOGIN_MAX_FAIL) throw new Error('パスワードを続けて間違えたため、5分間ログインできません');
+  if (String(pw || '') !== real) {
+    cache.put('ADM_FAIL', String(fails + 1), LOGIN_LOCK_SEC);
+    const left = LOGIN_MAX_FAIL - fails - 1;
+    throw new Error('パスワードが違います' + (left > 0 ? '（あと ' + left + ' 回）' : '（5分間ロックします）'));
+  }
+  cache.remove('ADM_FAIL');
+  return { token: adminToken_(real) };
+}
+
+function adminToken_(pw) {
+  const props = PropertiesService.getScriptProperties();
+  let salt = props.getProperty('ADMIN_TOKEN_SALT');
+  if (!salt) { salt = Utilities.getUuid(); props.setProperty('ADMIN_TOKEN_SALT', salt); }
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, salt + '|' + pw, Utilities.Charset.UTF_8);
+  return Utilities.base64EncodeWebSafe(bytes);
+}
+
+function requireAuth_(token) {
+  const real = PropertiesService.getScriptProperties().getProperty('ADMIN_PW') || '';
+  if (!real || !token || token !== adminToken_(real)) throw new Error('AUTH:ログインが必要です');
+}
+
+// ===== 画面から呼ぶAPI =====
+// どの関数も最初の引数はログイン時にもらったトークン
+function admGetState(token) {
+  requireAuth_(token);
+  return buildState_();
+}
+
+function admLookup(token, code) {
+  requireAuth_(token);
+  code = normCode_(code);
+  if (!YJ_RE.test(code)) return { ok: false, message: 'YJコードの形式ではありません（12桁）' };
+  const ss = adminSs_();
+  const m = readMaster_(ss);
+  const hit = m.byCode.get(code);
+  if (hit) return { ok: true, exact: true, name: hit.name, spec: hit.spec, maker: hit.maker };
+  const near = m.by9.get(code.slice(0, 9));
+  if (near) return { ok: true, exact: false, name: near.name, spec: near.spec, maker: near.maker };
+  return { ok: false, message: '医薬品一覧に見つかりません（そのまま登録はできます）' };
+}
+
+/**
+ * 医薬品一覧の検索（個別追加用）
+ * 品名・成分名・メーカー名・規格（部分一致）とYJコード（4文字以上の前方一致）を対象に、
+ * 空白区切りのすべての語に当てはまる行を返す
+ * ひらがなはカタカナとして比較する（「あむろ」→「アムロ」）
+ * @return {{items:Array, total:number, limit:number}}
+ */
+function admSearchMaster(token, query, limit) {
+  requireAuth_(token);
+  limit = Math.max(1, Math.min(300, Number(limit) || 100));
+  const terms = String(query || '').split(/[\s\u3000]+/).map(searchNorm_).filter(Boolean);
+  if (!terms.length) return { items: [], total: 0, limit };
+  const ss = adminSs_();
+  const adopted = new Set(readAdopted_(ss).map(r => r.code));
+  const ms = ss.getSheetByName(SHEET_MASTER);
+  if (!ms) throw new Error('シートがありません: ' + SHEET_MASTER);
+  const mv = ms.getDataRange().getValues();
+  const mh = mv[0].map(h => String(h).trim());
+  const need = name => {
+    const i = mh.indexOf(name);
+    if (i < 0) throw new Error(SHEET_MASTER + ' に列がありません: ' + name);
+    return i;
+  };
+  const opt = name => mh.indexOf(name);
+  const cCode = need('薬価基準収載医薬品コード'), cName = need('品名'), cMaker = need('メーカー名'), cSpec = need('規格');
+  const cGen = opt('成分名'), cKubun = opt('区分'), cPrice = opt('薬価');
+  const cSen = opt('先発医薬品');
+  const cKou = mh.findIndex(h => h.indexOf('後発医薬品') >= 0 && h.indexOf('算定対象') >= 0);
+  const val = (r, i) => i < 0 ? '' : String(r[i] == null ? '' : r[i]).trim();
+
+  const hits = [], seen = new Set();
+  let total = 0;
+  for (let i = 1; i < mv.length; i++) {
+    const r = mv[i];
+    const code = normCode_(r[cCode]);
+    if (!YJ_RE.test(code) || seen.has(code)) continue;
+    seen.add(code);
+    const name = val(r, cName), gen = val(r, cGen), maker = val(r, cMaker), spec = val(r, cSpec);
+    const hay = searchNorm_(name + '|' + gen + '|' + maker + '|' + spec);
+    // YJコードは4文字以上の前方一致だけで判定（数字の語がコードの途中に当たらないように）
+    if (!terms.every(t => hay.indexOf(t) >= 0 || (t.length >= 4 && code.indexOf(t) === 0))) continue;
+    total++;
+    const nName = searchNorm_(name);
+    const rank = nName.indexOf(terms[0]) === 0 ? 0 : (nName.indexOf(terms[0]) >= 0 ? 1 : 2); // 品名の先頭一致を優先
+    const sen = val(r, cSen), kou = val(r, cKou);
+    hits.push({
+      code, name, gen, maker, spec, kubun: val(r, cKubun), price: val(r, cPrice),
+      kind: kou ? '後発品' : (sen || ''), adopted: adopted.has(code), rank
+    });
+  }
+  hits.sort((a, b) => (a.rank - b.rank) || (a.adopted === b.adopted ? 0 : (a.adopted ? -1 : 1)) || a.name.localeCompare(b.name, 'ja'));
+  return { items: hits.slice(0, limit).map(h => { delete h.rank; return h; }), total, limit };
+}
+
+// 検索用の正規化：NFKC・空白除去・英字大文字・ひらがな→カタカナ
+function searchNorm_(s) {
+  return String(s == null ? '' : s).normalize('NFKC').replace(/[\s\u3000]/g, '').toUpperCase()
+    .replace(/[\u3041-\u3096]/g, c => String.fromCharCode(c.charCodeAt(0) + 0x60));
+}
+
+function admAdd(token, rec) {
+  requireAuth_(token);
+  return withLock_(() => {
+    const ss = adminSs_();
+    const code = normCode_(rec.code);
+    if (!YJ_RE.test(code)) throw new Error('YJコードの形式ではありません：' + rec.code);
+    const name = String(rec.name || '').trim();
+    if (!name) throw new Error('薬品名を入力してください');
+    const rows = readAdopted_(ss);
+    if (rows.some(r => r.code === code)) throw new Error('すでに登録されています：' + code);
+    backupAdopted_(ss);
+    rows.push({ code, name, spec: String(rec.spec || '').trim(), memo: String(rec.memo || '').trim() });
+    writeAdopted_(ss, rows);
+    addHistory_(ss, '個別追加', rows.length - 1, rows.length, code + ' ' + name);
+    return buildState_(ss, '追加しました：' + name);
+  });
+}
+
+function admDelete(token, code) {
+  requireAuth_(token);
+  return withLock_(() => {
+    const ss = adminSs_();
+    code = normCode_(code);
+    const rows = readAdopted_(ss);
+    const target = rows.find(r => r.code === code);
+    if (!target) throw new Error('見つかりません：' + code);
+    backupAdopted_(ss);
+    const next = rows.filter(r => r.code !== code);
+    writeAdopted_(ss, next);
+    addHistory_(ss, '個別削除', rows.length, next.length, code + ' ' + target.name);
+    return buildState_(ss, '削除しました：' + target.name);
+  });
+}
+
+function admUpdateMemo(token, code, memo) {
+  requireAuth_(token);
+  return withLock_(() => {
+    const ss = adminSs_();
+    code = normCode_(code);
+    const rows = readAdopted_(ss);
+    const target = rows.find(r => r.code === code);
+    if (!target) throw new Error('見つかりません：' + code);
+    backupAdopted_(ss);
+    target.memo = String(memo || '').trim();
+    writeAdopted_(ss, rows);
+    addHistory_(ss, 'メモ変更', rows.length, rows.length, code + ' ' + target.name);
+    return buildState_(ss, 'メモを更新しました：' + target.name);
+  });
+}
+
+/**
+ * 採用薬一括アップロード
+ * @param {string} token ログイン時のトークン
+ * @param {Array<{code,name,spec,memo}>} items 画面側で列を選んで作った配列
+ * @param {string} mode 'replace'（置換）| 'append'（追加）
+ * @param {string} fileName 履歴用
+ */
+function admUpload(token, items, mode, fileName) {
+  requireAuth_(token);
+  return withLock_(() => {
+    const ss = adminSs_();
+    const before = readAdopted_(ss);
+    const seen = new Set();
+    const invalid = [];
+    let dupInFile = 0;
+    const clean = [];
+    (items || []).forEach((it, i) => {
+      const code = normCode_(it.code);
+      if (!YJ_RE.test(code)) { if (String(it.code || '').trim()) invalid.push(i + 1); return; }
+      if (seen.has(code)) { dupInFile++; return; }
+      seen.add(code);
+      clean.push({ code, name: String(it.name || '').trim(), spec: String(it.spec || '').trim(), memo: String(it.memo || '').trim() });
+    });
+    if (!clean.length) throw new Error('有効なYJコードが1件もありません。列の選び方を確認してください');
+
+    let next, skippedExisting = 0;
+    if (mode === 'append') {
+      const have = new Set(before.map(r => r.code));
+      const add = clean.filter(r => { if (have.has(r.code)) { skippedExisting++; return false; } return true; });
+      next = before.concat(add);
+    } else {
+      next = clean;
+    }
+    backupAdopted_(ss);
+    writeAdopted_(ss, next);
+    addHistory_(ss, mode === 'append' ? '一括追加' : '一括置換', before.length, next.length,
+      (fileName || '') + '（有効 ' + clean.length + '件' +
+      (invalid.length ? '／形式エラー ' + invalid.length + '件' : '') +
+      (dupInFile ? '／ファイル内重複 ' + dupInFile + '件' : '') +
+      (skippedExisting ? '／登録済みスキップ ' + skippedExisting + '件' : '') + '）');
+    const msg = (mode === 'append' ? '追加しました：' + (next.length - before.length) + '件' : '入れ替えました：' + next.length + '件') +
+      (invalid.length ? '（形式エラー ' + invalid.length + '件は除外）' : '');
+    const st = buildState_(ss, msg);
+    st.uploadResult = { valid: clean.length, invalidRows: invalid.slice(0, 30), invalidCount: invalid.length, dupInFile, skippedExisting };
+    return st;
+  });
+}
+
+function admRestore(token, backupName) {
+  requireAuth_(token);
+  return withLock_(() => {
+    const ss = adminSs_();
+    const sh = ss.getSheetByName(backupName);
+    if (!sh || backupName.indexOf(BACKUP_PREFIX) !== 0) throw new Error('バックアップが見つかりません：' + backupName);
+    const restored = rowsFromSheet_(sh);
+    const before = readAdopted_(ss);
+    backupAdopted_(ss, backupName); // 今の状態も退避（復元元は消さない）
+    writeAdopted_(ss, restored);
+    addHistory_(ss, 'ロールバック', before.length, restored.length, backupLabel_(backupName) + ' の状態に戻した');
+    return buildState_(ss, backupLabel_(backupName) + ' の状態に戻しました（' + restored.length + '件）');
+  });
+}
+
+// 一括ダウンロード（画面からのダウンロードができない環境向け）：スプレッドシートと同じフォルダにCSVを保存
+function admExportCsv(token) {
+  requireAuth_(token);
+  const ss = adminSs_();
+  const rows = readAdopted_(ss);
+  const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const csv = '﻿' + [ADOPTED_HEADER].concat(rows.map(r => [r.code, r.name, r.spec, r.memo]))
+    .map(r => r.map(q).join(',')).join('\r\n');
+  const name = '採用薬_' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyyMMdd_HHmm') + '.csv';
+  const blob = Utilities.newBlob(csv, 'text/csv', name);
+  const parents = DriveApp.getFileById(ss.getId()).getParents();
+  const file = parents.hasNext() ? parents.next().createFile(blob) : DriveApp.createFile(blob);
+  addHistory_(ss, 'ダウンロード', rows.length, rows.length, 'ドライブに保存：' + name);
+  return { name, url: file.getUrl() };
+}
+
+// ===== 医薬品一覧アップロード =====
+/**
+ * 厚労省「薬価基準収載品目リスト」（tpYYYYMMDD-01_01〜_04.xlsx）を取り込む
+ * 画面側でExcelを読み、見出し行から列を特定して、MASTER_HEADER の先頭12列の並びにした行を送ってくる
+ * @param {string} token
+ * @param {{files:Array<{name:string, kind:string, rows:Array<Array<string>>}>, mode:string}} payload
+ *   mode : 'merge'（追記・更新。今の一覧にしかない品目も残す）| 'replace'（置き換え）
+ */
+function admUploadMaster(token, payload) {
+  requireAuth_(token);
+  return withLock_(() => {
+    const ss = adminSs_();
+    const files = (payload && payload.files) || [];
+    if (!files.length) throw new Error('ファイルがありません');
+    const mode = payload.mode === 'replace' ? 'replace' : 'merge';
+
+    // 新しいリスト（コードで一意化）
+    const incoming = new Map();
+    let invalid = 0;
+    files.forEach(f => {
+      const base = String(f.name || '').replace(/\.xlsx?$/i, '');
+      (f.rows || []).forEach(r => {
+        const code = normCode_(r[1]);
+        if (!YJ_RE.test(code)) { invalid++; return; }
+        const row = MASTER_HEADER.map((_, i) => i < 12 ? String(r[i] == null ? '' : r[i]).trim() : base);
+        row[1] = code;
+        incoming.set(code, row);
+      });
+    });
+    if (incoming.size < 100) throw new Error('有効な品目が ' + incoming.size + ' 件しかありません。薬価基準収載品目リストのファイルか確認してください');
+
+    // 今の一覧（見出し名で読み、標準の並びにそろえる）
+    const sh = ss.getSheetByName(SHEET_MASTER) || ss.insertSheet(SHEET_MASTER);
+    const current = readMasterRows_(sh);
+
+    let added = 0, updated = 0, kept = 0;
+    const out = new Map();
+    if (mode === 'merge') {
+      current.forEach((row, code) => {
+        if (incoming.has(code)) return;
+        out.set(code, row); kept++;
+      });
+    }
+    incoming.forEach((row, code) => {
+      if (current.has(code)) updated++; else added++;
+      out.set(code, row);
+    });
+    const removed = mode === 'replace' ? Array.from(current.keys()).filter(c => !incoming.has(c)).length : 0;
+
+    const rows = Array.from(out.values()).sort((a, b) => {
+      const ka = KUBUN_ORDER.indexOf(a[0]), kb = KUBUN_ORDER.indexOf(b[0]);
+      return ((ka < 0 ? 9 : ka) - (kb < 0 ? 9 : kb)) || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0);
+    });
+
+    // バックアップ（1世代）→ 書き込み
+    if (sh.getLastRow() > 1) {
+      const old = ss.getSheetByName(MASTER_BACKUP);
+      if (old) ss.deleteSheet(old);
+      sh.copyTo(ss).setName(MASTER_BACKUP).hideSheet();
+    }
+    writeMasterRows_(sh, rows);
+
+    const names = files.map(f => f.name).join('、');
+    const info = {
+      at: Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm'),
+      files: files.map(f => f.name), count: rows.length, mode
+    };
+    PropertiesService.getScriptProperties().setProperty('MASTER_INFO', JSON.stringify(info));
+    addHistory_(ss, '医薬品一覧更新', current.size, rows.length,
+      names + '（' + (mode === 'merge' ? '追記・更新' : '置き換え') + '／追加 ' + added + '・更新 ' + updated +
+      (mode === 'merge' ? '・以前の品目を保持 ' + kept : '・削除 ' + removed) + (invalid ? '・コードなし ' + invalid + '行' : '') + '）');
+
+    const st = buildState_(ss, '医薬品一覧を取り込みました（' + rows.length + '件）');
+    st.masterResult = { added, updated, kept, removed, total: rows.length, invalid, mode };
+    return st;
+  });
+}
+
+// 医薬品一覧を取り込み直前の状態に戻す
+function admRestoreMaster(token) {
+  requireAuth_(token);
+  return withLock_(() => {
+    const ss = adminSs_();
+    const bk = ss.getSheetByName(MASTER_BACKUP);
+    if (!bk) throw new Error('医薬品一覧のバックアップがありません');
+    const sh = ss.getSheetByName(SHEET_MASTER) || ss.insertSheet(SHEET_MASTER);
+    const before = readMasterRows_(sh).size;
+    const rows = Array.from(readMasterRows_(bk).values());
+    writeMasterRows_(sh, rows);
+    ss.deleteSheet(bk);
+    PropertiesService.getScriptProperties().deleteProperty('MASTER_INFO');
+    addHistory_(ss, '医薬品一覧を戻す', before, rows.length, '取り込み前の医薬品一覧に戻した');
+    return buildState_(ss, '医薬品一覧を取り込み前の状態に戻しました（' + rows.length + '件）');
+  });
+}
+
+// 医薬品一覧シートを「コード → MASTER_HEADER の並びの行」のMapで読む（見出し名で列を探す）
+function readMasterRows_(sh) {
+  const out = new Map();
+  if (sh.getLastRow() < 2) return out;
+  const v = sh.getDataRange().getDisplayValues();
+  const head = v[0].map(h => String(h).replace(/\s/g, ''));
+  const idx = MASTER_HEADER.map(h => head.indexOf(h.replace(/\s/g, '')));
+  const iCode = idx[1];
+  if (iCode < 0) return out;
+  for (let i = 1; i < v.length; i++) {
+    const code = normCode_(v[i][iCode]);
+    if (!YJ_RE.test(code)) continue;
+    const row = idx.map(j => j < 0 ? '' : String(v[i][j]));
+    row[1] = code;
+    out.set(code, row);
+  }
+  return out;
+}
+
+function writeMasterRows_(sh, rows) {
+  sh.clearContents();
+  const data = [MASTER_HEADER].concat(rows);
+  const W = MASTER_HEADER.length;
+  ensureSize_(sh, data.length, W);
+  sh.getRange(1, 2, data.length, 1).setNumberFormat('@');
+  const CHUNK = 5000;
+  for (let i = 0; i < data.length; i += CHUNK) {
+    const part = data.slice(i, i + CHUNK);
+    sh.getRange(i + 1, 1, part.length, W).setValues(part);
+  }
+  sh.getRange(1, 1, 1, W).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  const extra = sh.getMaxRows() - data.length;
+  if (extra > 100) sh.deleteRows(data.length + 101, extra - 100);
+}
+
+// 書き込む行数・列数がシートの大きさを超える場合は広げる
+function ensureSize_(sh, rows, cols) {
+  if (sh.getMaxRows() < rows) sh.insertRowsAfter(sh.getMaxRows(), rows - sh.getMaxRows());
+  if (sh.getMaxColumns() < cols) sh.insertColumnsAfter(sh.getMaxColumns(), cols - sh.getMaxColumns());
+}
+
+function masterInfo_(ss, master) {
+  let info = null;
+  try { info = JSON.parse(PropertiesService.getScriptProperties().getProperty('MASTER_INFO') || 'null'); } catch (e) {}
+  return {
+    count: master ? master.byCode.size : 0,
+    info,
+    hasBackup: !!ss.getSheetByName(MASTER_BACKUP)
+  };
+}
+
+// ===== 状態の組み立て =====
+function buildState_(ss, message) {
+  ss = ss || adminSs_();
+  const rows = readAdopted_(ss);
+  let master = null, masterError = '';
+  try { master = readMaster_(ss); } catch (e) { masterError = e.message; }
+  let n12 = 0, n9 = 0, n0 = 0;
+  const list = rows.map(r => {
+    let st = '';
+    if (master) {
+      if (master.byCode.has(r.code)) { st = 'exact'; n12++; }
+      else if (master.by9.has(r.code.slice(0, 9))) { st = 'near'; n9++; }
+      else { st = 'none'; n0++; }
+    }
+    return { code: r.code, name: r.name, spec: r.spec, memo: r.memo, st };
+  });
+  const hist = readHistory_(ss, 50);
+  return {
+    message: message || '',
+    sheetName: ss.getName(),
+    count: rows.length,
+    match: master ? { exact: n12, near: n9, none: n0, masterCount: master.byCode.size } : null,
+    masterError,
+    masterInfo: masterInfo_(ss, master),
+    lastUpdate: hist.length ? hist[0].date : '',
+    list,
+    history: hist,
+    backups: listBackups_(ss),
+    generations: backupGenerations_()
+  };
+}
+
+// ===== 採用薬シートの読み書き =====
+function adoptedSheet_(ss) {
+  let sh = ss.getSheetByName(SHEET_ADOPTED);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_ADOPTED);
+    sh.getRange(1, 1, 1, ADOPTED_HEADER.length).setValues([ADOPTED_HEADER]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function rowsFromSheet_(sh) {
+  const v = sh.getDataRange().getValues();
+  if (v.length < 1) return [];
+  const h = v[0].map(x => String(x).trim());
+  const iCode = h.indexOf('YJコード') >= 0 ? h.indexOf('YJコード') : 0;
+  const iName = h.indexOf('薬品名') >= 0 ? h.indexOf('薬品名') : 1;
+  const iSpec = h.indexOf('規格') >= 0 ? h.indexOf('規格') : 2;
+  const iMemo = h.indexOf('メモ') >= 0 ? h.indexOf('メモ') : 3;
+  const out = [], seen = new Set();
+  for (let i = 1; i < v.length; i++) {
+    const code = normCode_(v[i][iCode]);
+    if (!YJ_RE.test(code) || seen.has(code)) continue;
+    seen.add(code);
+    out.push({
+      code,
+      name: String(v[i][iName] == null ? '' : v[i][iName]),
+      spec: String(v[i][iSpec] == null ? '' : v[i][iSpec]),
+      memo: String(v[i][iMemo] == null ? '' : v[i][iMemo])
+    });
+  }
+  return out;
+}
+
+function readAdopted_(ss) {
+  return rowsFromSheet_(adoptedSheet_(ss));
+}
+
+function writeAdopted_(ss, rows) {
+  const sh = adoptedSheet_(ss);
+  sh.clearContents();
+  const data = [ADOPTED_HEADER].concat(rows.map(r => [r.code, r.name, r.spec, r.memo]));
+  ensureSize_(sh, data.length, ADOPTED_HEADER.length);
+  sh.getRange(1, 1, data.length, 1).setNumberFormat('@');
+  sh.getRange(1, 1, data.length, ADOPTED_HEADER.length).setValues(data);
+  sh.getRange(1, 1, 1, ADOPTED_HEADER.length).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  const extra = sh.getMaxRows() - data.length;
+  if (extra > 50) sh.deleteRows(data.length + 51, extra - 50); // 余分な空行を整理
+}
+
+// ===== 医薬品一覧（照合状況・コード検索用） =====
+function readMaster_(ss) {
+  const ms = ss.getSheetByName(SHEET_MASTER);
+  if (!ms) throw new Error('シートがありません: ' + SHEET_MASTER);
+  const mv = ms.getDataRange().getValues();
+  const mh = mv[0].map(h => String(h).trim());
+  const col = name => {
+    const i = mh.indexOf(name);
+    if (i < 0) throw new Error(SHEET_MASTER + ' に列がありません: ' + name);
+    return i;
+  };
+  const cCode = col('薬価基準収載医薬品コード'), cName = col('品名'), cMaker = col('メーカー名'), cSpec = col('規格');
+  const byCode = new Map(), by9 = new Map();
+  for (let i = 1; i < mv.length; i++) {
+    const code = normCode_(mv[i][cCode]);
+    if (!YJ_RE.test(code)) continue;
+    const rec = { name: String(mv[i][cName]), spec: String(mv[i][cSpec]), maker: String(mv[i][cMaker]) };
+    byCode.set(code, rec);
+    if (!by9.has(code.slice(0, 9))) by9.set(code.slice(0, 9), rec);
+  }
+  return { byCode, by9 };
+}
+
+// ===== バックアップ（ロールバック用） =====
+function backupGenerations_() {
+  const n = Number(PropertiesService.getScriptProperties().getProperty('BACKUP_GENERATIONS') || 3);
+  return Math.max(1, Math.min(10, n || 3));
+}
+
+function backupAdopted_(ss, keepName) {
+  const src = adoptedSheet_(ss);
+  const stamp = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyyMMdd_HHmmss');
+  let name = BACKUP_PREFIX + stamp, k = 1;
+  while (ss.getSheetByName(name)) name = BACKUP_PREFIX + stamp + '_' + (++k);
+  const copy = src.copyTo(ss).setName(name);
+  copy.hideSheet();
+  // 古い世代を削除（keepName は復元中なので残す）
+  const gens = backupGenerations_();
+  const bks = ss.getSheets().map(s => s.getName()).filter(n => n.indexOf(BACKUP_PREFIX) === 0).sort().reverse();
+  bks.slice(gens).forEach(n => { if (n !== keepName) ss.deleteSheet(ss.getSheetByName(n)); });
+}
+
+function listBackups_(ss) {
+  return ss.getSheets()
+    .filter(s => s.getName().indexOf(BACKUP_PREFIX) === 0)
+    .map(s => ({ name: s.getName(), label: backupLabel_(s.getName()), count: rowsFromSheet_(s).length }))
+    .sort((a, b) => a.name < b.name ? 1 : -1);
+}
+
+function backupLabel_(name) {
+  const m = name.match(/(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
+  return m ? m[1] + '/' + m[2] + '/' + m[3] + ' ' + m[4] + ':' + m[5] + ':' + m[6] : name;
+}
+
+// ===== 更新履歴 =====
+function historySheet_(ss) {
+  let sh = ss.getSheetByName(SHEET_ADOPTED_HISTORY);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_ADOPTED_HISTORY);
+    sh.appendRow(['日時', '操作', '変更前件数', '変更後件数', '内容', '実行者']);
+    sh.getRange(1, 1, 1, 6).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function addHistory_(ss, op, before, after, detail) {
+  let who = '';
+  try { who = Session.getActiveUser().getEmail() || ''; } catch (e) {}
+  historySheet_(ss).appendRow([
+    Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'), op, before, after, detail, who
+  ]);
+}
+
+function readHistory_(ss, limit) {
+  const sh = ss.getSheetByName(SHEET_ADOPTED_HISTORY);
+  if (!sh || sh.getLastRow() < 2) return [];
+  const n = Math.min(limit, sh.getLastRow() - 1);
+  const v = sh.getRange(sh.getLastRow() - n + 1, 1, n, 6).getDisplayValues();
+  return v.reverse().map(r => ({ date: r[0], op: r[1], before: r[2], after: r[3], detail: r[4], who: r[5] }));
+}
+
+// ===== 共通 =====
+function adminSs_() {
+  const p = PropertiesService.getScriptProperties();
+  const id = p.getProperty('SHEET_ID') || '';
+  if (id) return SpreadsheetApp.openById(id);
+  let ss = null;
+  try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) {}
+  if (ss) return ss;
+  const auto = p.getProperty('AUTO_SHEET_ID');
+  if (auto) return SpreadsheetApp.openById(auto);
+  throw new Error('スプレッドシートが特定できません。一度スプレッドシートのメニューから管理画面を開いてください');
+}
+
+function rememberSheetId_() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (ss) PropertiesService.getScriptProperties().setProperty('AUTO_SHEET_ID', ss.getId());
+  } catch (e) {}
+}
+
+function withLock_(fn) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) throw new Error('ほかの人が更新中です。少し待ってからもう一度お試しください');
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
